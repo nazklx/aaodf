@@ -37,7 +37,9 @@ def main() -> int:
 
     release = target.name if target.is_dir() else first.stem
     name = release if multi else first.stem
-    out_dir = Path.cwd() / f"UPLOAD.{name}"
+    ROOT_OUTPUT_DIR = Path("output")
+    ROOT_OUTPUT_DIR.mkdir(exist_ok=True)
+    out_dir = ROOT_OUTPUT_DIR / f"UPLOAD.{name}"
     out_dir.mkdir(mode=0o755, parents=True, exist_ok=True)
     job = Job(
         target=target, sources=sources, first=first, release=release, name=name,
