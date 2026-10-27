@@ -284,16 +284,31 @@ def make_screenshots(job: Job, jitter: bool = False, extract_frames_func=None) -
 
 def host_screenshots(job: Job) -> bool:
     from .uploaders import upload_image
+    from .core import short_name
+    import sys
+    from pathlib import Path
+
     files = sorted(job.out_dir.glob("*.png"))
     if not files:
         print(f"No PNG files found in: {job.out_dir}", file=sys.stderr)
         return False
-    links = []
-    for f in files:
+
+    total = len(files)
+    links: list[str] = []
+    failed: list[Path] = []
+    
+    for n, f in enumerate(files, 1):
+        print(f"[{n}/{total}] {short_name(f)}", flush=True)
         bb, log = upload_image(f)
-        print("\n".join(log))
+        print("\n".join(log), flush=True)
         if bb:
             links.append(bb)
+        else:
+            failed.append(f)
+
+    print(f"\nUploaded {len(links)}/{total} images.")
+    if failed:
+        print("Failed: " + ", ".join(short_name(f, 24) for f in failed))
     update_description(job, links=links)
     return True
 

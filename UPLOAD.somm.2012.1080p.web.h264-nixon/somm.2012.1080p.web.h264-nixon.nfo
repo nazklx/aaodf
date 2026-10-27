@@ -1,0 +1,113 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<MediaInfo
+    xmlns="https://mediaarea.net/mediainfo"
+    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+    xsi:schemaLocation="https://mediaarea.net/mediainfo https://mediaarea.net/mediainfo/mediainfo_2_0.xsd"
+    version="2.0">
+<creatingLibrary version="24.01" url="https://mediaarea.net/MediaInfo">MediaInfoLib</creatingLibrary>
+<media ref="/home/op/Downloads/somm.2012.1080p.web.h264-nixon.mkv">
+<track type="General">
+<UniqueID>30003842156715991737066417525502388877</UniqueID>
+<VideoCount>1</VideoCount>
+<AudioCount>1</AudioCount>
+<TextCount>1</TextCount>
+<FileExtension>mkv</FileExtension>
+<Format>Matroska</Format>
+<Format_Version>4</Format_Version>
+<FileSize>4025451368</FileSize>
+<Duration>5627.734</Duration>
+<OverallBitRate>5722305</OverallBitRate>
+<FrameRate>23.976</FrameRate>
+<FrameCount>134926</FrameCount>
+<StreamSize>1446449</StreamSize>
+<IsStreamable>Yes</IsStreamable>
+<Encoded_Date>2019-12-28 18:09:37 UTC</Encoded_Date>
+<File_Modified_Date>2026-10-25 16:39:13 UTC</File_Modified_Date>
+<File_Modified_Date_Local>2026-10-25 12:39:13</File_Modified_Date_Local>
+<Encoded_Application>mkvmerge v41.0.0 (&apos;Smarra&apos;) 64-bit</Encoded_Application>
+<Encoded_Library>libebml v1.3.9 + libmatroska v1.5.2</Encoded_Library>
+</track>
+<track type="Video">
+<StreamOrder>0</StreamOrder>
+<ID>1</ID>
+<UniqueID>12040306659007467620</UniqueID>
+<Format>AVC</Format>
+<Format_Profile>High</Format_Profile>
+<Format_Level>4</Format_Level>
+<Format_Settings_CABAC>Yes</Format_Settings_CABAC>
+<Format_Settings_RefFrames>4</Format_Settings_RefFrames>
+<CodecID>V_MPEG4/ISO/AVC</CodecID>
+<Duration>5627.539000000</Duration>
+<BitRate>5656334</BitRate>
+<Width>1920</Width>
+<Height>1080</Height>
+<Stored_Height>1088</Stored_Height>
+<Sampled_Width>1920</Sampled_Width>
+<Sampled_Height>1080</Sampled_Height>
+<PixelAspectRatio>1.000</PixelAspectRatio>
+<DisplayAspectRatio>1.778</DisplayAspectRatio>
+<FrameRate_Mode>CFR</FrameRate_Mode>
+<FrameRate_Mode_Original>VFR</FrameRate_Mode_Original>
+<FrameRate>23.976</FrameRate>
+<FrameRate_Num>24000</FrameRate_Num>
+<FrameRate_Den>1001</FrameRate_Den>
+<FrameCount>134926</FrameCount>
+<ColorSpace>YUV</ColorSpace>
+<ChromaSubsampling>4:2:0</ChromaSubsampling>
+<BitDepth>8</BitDepth>
+<ScanType>Progressive</ScanType>
+<Delay>0.000</Delay>
+<Delay_Source>Container</Delay_Source>
+<StreamSize>3978905638</StreamSize>
+<Language>en</Language>
+<Default>Yes</Default>
+<Forced>No</Forced>
+</track>
+<track type="Audio">
+<StreamOrder>1</StreamOrder>
+<ID>2</ID>
+<UniqueID>6023060124996666425</UniqueID>
+<Format>AAC</Format>
+<Format_Commercial_IfAny>HE-AAC</Format_Commercial_IfAny>
+<Format_Settings_SBR>Yes (Explicit)</Format_Settings_SBR>
+<Format_AdditionalFeatures>LC SBR</Format_AdditionalFeatures>
+<CodecID>A_AAC-2</CodecID>
+<Duration>5627.734000000</Duration>
+<BitRate>63999</BitRate>
+<Channels>2</Channels>
+<ChannelPositions>Front: L R</ChannelPositions>
+<ChannelLayout>L R</ChannelLayout>
+<SamplesPerFrame>2048</SamplesPerFrame>
+<SamplingRate>48000</SamplingRate>
+<SamplingCount>270131232</SamplingCount>
+<FrameRate>23.438</FrameRate>
+<FrameCount>131900</FrameCount>
+<Compression_Mode>Lossy</Compression_Mode>
+<Delay>0.000</Delay>
+<Delay_Source>Container</Delay_Source>
+<Video_Delay>0.000</Video_Delay>
+<StreamSize>45021867</StreamSize>
+<Language>en</Language>
+<Default>Yes</Default>
+<Forced>No</Forced>
+</track>
+<track type="Text">
+<StreamOrder>2</StreamOrder>
+<ID>3</ID>
+<UniqueID>11877289570332934129</UniqueID>
+<Format>UTF-8</Format>
+<CodecID>S_TEXT/UTF8</CodecID>
+<Duration>5501.134000000</Duration>
+<BitRate>112</BitRate>
+<FrameRate>0.313</FrameRate>
+<FrameCount>1724</FrameCount>
+<ElementCount>1724</ElementCount>
+<StreamSize>77414</StreamSize>
+<Title>English</Title>
+<Language>en</Language>
+<Default>No</Default>
+<Forced>No</Forced>
+</track>
+</media>
+</MediaInfo>
+

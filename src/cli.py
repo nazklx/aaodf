@@ -3,6 +3,7 @@ import os
 import shutil
 import subprocess
 import sys
+import re
 from pathlib import Path
 
 from .core import find_videos, episode_videos, episode_info, extract_frames, pause
@@ -46,11 +47,12 @@ def main() -> int:
     )
 
     extract_frames(job.sources, job.name, job.out_dir)
-    build_torrent(job)
 
     pause("Delete unwanted images, remaining images will be uploaded. Press ENTER to continue...\n")
     if not host_screenshots(job):
         return 0
+
+    build_torrent(job)
 
     print()
     job.info = lookup_tmdb(job.release, tv_hint=job.tv_hint)

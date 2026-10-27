@@ -9,6 +9,7 @@ from .models import UploadError
 from .core import short_msg
 
 UPLOAD_TIMEOUT = 120
+UPLOAD_WORKERS = 4
 
 def upload_imgbox(f: Path) -> str:
     if not shutil.which("imgbox"):
