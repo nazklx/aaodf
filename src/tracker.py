@@ -271,8 +271,7 @@ def edit_in_editor(text: str) -> str | None:
 def build_torrent(job: Job) -> None:
     print(f"Creating .torrent file from: {job.target}")
     torrent = Torrent(path=job.target, trackers=[ANNOUNCE_URL], private=True)
-    torrent.generate(callback=lambda _t, _p, done, total: print(f"\r  Hashing pieces: {done}/{total}", end="", flush=True), interval=0.25)
-    print()
+    torrent.generate()
     torrent.write(job.torrent_path, overwrite=True)
     print("Torrent created")
 

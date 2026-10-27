@@ -4,6 +4,7 @@ import shutil
 import subprocess
 import sys
 import re
+import threading
 from pathlib import Path
 
 from .core import find_videos, episode_videos, episode_info, extract_frames, pause
@@ -48,15 +49,34 @@ def main() -> int:
         tv_hint=any(episode_info(v) for v in videos),
     )
 
+    # Start .torrent creation asynchronously in the background
+    torrent_thread = threading.Thread(target=build_torrent, args=(job,), daemon=True)
+    torrent_thread.start()
+
     extract_frames(job.sources, job.name, job.out_dir)
 
     pause("Delete unwanted images, remaining images will be uploaded. Press ENTER to continue...\n")
     if not host_screenshots(job):
         return 0
 
-    build_torrent(job)
+    # Ensure background torrent creation has completed before proceeding to upload/description
+    if torrent_thread.is_alive():
+        torrent_thread.join() 
 
+    # Display torrent details right before description and uploading
     print()
+    print("=" * 40)
+    print("TORRENT DETAILS:")
+    print(f"File: {job.torrent_path.name}")
+    if job.torrent_path.exists():
+        size_mb = job.torrent_path.stat().st_size / (1024 * 1024)
+        print(f"Size: {size_mb:.2f} MB")
+        print(f"Path: {job.torrent_path}")
+    else:
+        print("Status: Torrent file creation failed or incomplete.")
+    print("=" * 40)
+    print()
+
     job.info = lookup_tmdb(job.release, tv_hint=job.tv_hint)
     update_description(job, overview=job.info.overview if job.info else "")
     print_description_block(job)
