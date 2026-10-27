@@ -1,2 +1,3 @@
 torf
 requests
+pyimgbox

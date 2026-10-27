@@ -11,7 +11,7 @@ setup_venv() {
     python3 -m venv .venv
     "${PYTHON_BIN}" -m pip install --upgrade pip --quiet
     if [ -f "requirements.txt" ]; then
-        "${PYTHON_BIN}" -m pip install -r requirements.txt --quiet
+        "${PYTHON_BIN}" -m pip install -r requirements.txt
     fi
 }
 

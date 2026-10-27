@@ -1,39 +1,35 @@
-import subprocess
-import json
+from __future__ import annotations
+import asyncio
 import requests
 from pathlib import Path
 
 def upload_imgbox(file_path: Path) -> tuple[str | None, list[str]]:
-    """Uploads an image using imgbox-cli and returns specific Imgbox BBCode."""
+    """Uploads an image using the pyimgbox library and returns specific Imgbox BBCode."""
     log = [f"Uploading {file_path.name} to imgbox..."]
     try:
-        result = subprocess.run(
-            ["imgbox", "--json", str(file_path)],
-            capture_output=True,
-            text=True,
-            timeout=60
-        )
-        
-        if result.returncode != 0:
-            err = result.stderr.strip() or result.stdout.strip() or "Unknown error"
-            log.append(f"imgbox: Failed -> {err}")
-            return None, log
+        import pyimgbox
 
-        data = json.loads(result.stdout)
-        item = data[0] if isinstance(data, list) and len(data) > 0 else data
+        async def _upload():
+            async with pyimgbox.Gallery() as gallery:
+                return await gallery.upload(str(file_path))
 
-        image_url = item.get("image_url")
-        thumb_url = item.get("thumbnail_url")
-
-        if image_url and thumb_url:
+        result = asyncio.run(_upload())
+        if result and result.get("success"):
+            image_url = result.get("image_url")
+            thumb_url = result.get("thumbnail_url")
+            
             # Imgbox specific BBCode: Thumbnail linked to full image
-            bbcode = f"[url={image_url}][img]{thumb_url}[/img][/url]"
+            bbcode = f"[img]{image_url}[/img]"
             log.append(f"imgbox: OK -> {image_url}")
             return bbcode, log
         else:
-            log.append(f"imgbox: Failed -> Missing URL fields in CLI output")
+            err_msg = result.get("error", "Unknown error") if result else "Unknown response structure"
+            log.append(f"imgbox: Failed -> {err_msg}")
             return None, log
 
+    except ImportError:
+        log.append("imgbox: Error -> 'pyimgbox' is not installed. Run: pip install pyimgbox")
+        return None, log
     except Exception as e:
         log.append(f"imgbox: Error -> {str(e)}")
         return None, log
@@ -62,7 +58,7 @@ def upload_pixhost(file_path: Path) -> tuple[str | None, list[str]]:
             show_url = data["show_url"]
             thumb_url = data.get("thumb_url", image_url)
             
-            bbcode = f"[url={show_url}][img]{thumb_url}[/img][/url]"
+            bbcode = f"[[img]{show_url}[/img]"
             log.append(f"pixhost: OK -> {image_url}")
             return bbcode, log
         else:
