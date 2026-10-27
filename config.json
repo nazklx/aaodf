@@ -1,0 +1,11 @@
+{
+  "announce_url": "#",
+  "tmdb_api_key": "#",
+  "tracker_api_token": "#",
+  "upload_endpoint": "#",
+  "confirm_before_upload": true,
+  "anonymous_upload": false,
+  "personal_release": false,
+  "stream_optimized": false,
+  "group_separator": "-"
+}
