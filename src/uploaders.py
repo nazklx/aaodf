@@ -1,82 +1,113 @@
-from __future__ import annotations
-import json
-import os
-import shutil
 import subprocess
+import json
 import requests
 from pathlib import Path
-from .models import UploadError
-from .core import short_msg
 
-UPLOAD_TIMEOUT = 120
-UPLOAD_WORKERS = 4
+def upload_imgbox(file_path: Path) -> tuple[str | None, list[str]]:
+    """Uploads an image using imgbox-cli and returns specific Imgbox BBCode."""
+    log = [f"Uploading {file_path.name} to imgbox..."]
+    try:
+        result = subprocess.run(
+            ["imgbox", "--json", str(file_path)],
+            capture_output=True,
+            text=True,
+            timeout=60
+        )
+        
+        if result.returncode != 0:
+            err = result.stderr.strip() or result.stdout.strip() or "Unknown error"
+            log.append(f"imgbox: Failed -> {err}")
+            return None, log
 
-def upload_imgbox(f: Path) -> str:
-    if not shutil.which("imgbox"):
-        raise UploadError("imgbox CLI not installed")
-    try:
-        r = subprocess.run(["imgbox", "--json", str(f)], capture_output=True,
-                           text=True, timeout=UPLOAD_TIMEOUT, stdin=subprocess.DEVNULL)
-    except (subprocess.SubprocessError, OSError) as e:
-        raise UploadError(short_msg(e) or type(e).__name__)
-    if r.returncode != 0:
-        raise UploadError(f"exit {r.returncode}: {short_msg(r.stderr)}")
-    try:
-        data = json.loads(r.stdout)
-    except ValueError:
-        raise UploadError("could not parse imgbox output")
-    items = data if isinstance(data, list) else (list(data.values()) if isinstance(data, dict) else [])
-    for item in items:
-        if isinstance(item, dict) and item.get("success") and item.get("image_url"):
-            return f"[img]{item['image_url']}[/img]"
-    raise UploadError("response reported no successful upload")
+        data = json.loads(result.stdout)
+        item = data[0] if isinstance(data, list) and len(data) > 0 else data
 
-def upload_pixhost(f: Path) -> str:
+        image_url = item.get("image_url")
+        thumb_url = item.get("thumbnail_url")
+
+        if image_url and thumb_url:
+            # Imgbox specific BBCode: Thumbnail linked to full image
+            bbcode = f"[url={image_url}][img]{thumb_url}[/img][/url]"
+            log.append(f"imgbox: OK -> {image_url}")
+            return bbcode, log
+        else:
+            log.append(f"imgbox: Failed -> Missing URL fields in CLI output")
+            return None, log
+
+    except Exception as e:
+        log.append(f"imgbox: Error -> {str(e)}")
+        return None, log
+
+
+def upload_pixhost(file_path: Path) -> tuple[str | None, list[str]]:
+    """Uploads an image to Pixhost with its own specific formatting."""
+    log = [f"Uploading {file_path.name} to pixhost..."]
     try:
-        with f.open("rb") as fh:
-            r = requests.post(
-                "https://api.pixhost.cc/images",
-                headers={"Accept": "application/json"},
-                files={"img": (f.name, fh)},
-                data={"content_type": "0", "max_th_size": "0"},
-                timeout=UPLOAD_TIMEOUT,
+        with open(file_path, "rb") as f:
+            resp = requests.post(
+                "https://api.pixhost.to/images",
+                files={"img": f},
+                data={"content_type": "0"},
+                timeout=30
             )
-        r.raise_for_status()
-        url = r.json().get("show_url")
-    except (requests.RequestException, ValueError, OSError) as e:
-        raise UploadError(short_msg(e) or type(e).__name__)
-    if not url:
-        raise UploadError("no show_url in response")
-    return f"[img]{url}[/img]"
+        
+        try:
+            data = resp.json()
+        except Exception:
+            log.append(f"pixhost: Failed -> Invalid JSON response (HTTP {resp.status_code})")
+            return None, log
 
-def upload_catbox(f: Path) -> str:
-    data = {"reqtype": "fileupload"}
-    if userhash := os.environ.get("CATBOX_USERHASH"):
-        data["userhash"] = userhash
+        if "show_url" in data and "image_url" in data:
+            image_url = data["image_url"]
+            show_url = data["show_url"]
+            thumb_url = data.get("thumb_url", image_url)
+            
+            bbcode = f"[url={show_url}][img]{thumb_url}[/img][/url]"
+            log.append(f"pixhost: OK -> {image_url}")
+            return bbcode, log
+        else:
+            log.append(f"pixhost: Failed -> Unexpected API response structure")
+            return None, log
+            
+    except Exception as e:
+        log.append(f"pixhost: Error -> {str(e)}")
+        return None, log
+
+
+def upload_catbox(file_path: Path) -> tuple[str | None, list[str]]:
+    """Uploads an image to Catbox with its own formatting."""
+    log = [f"Uploading {file_path.name} to catbox..."]
     try:
-        with f.open("rb") as fh:
-            r = requests.post("https://catbox.moe/user/api.php", data=data,
-                              files={"fileToUpload": (f.name, fh)}, timeout=UPLOAD_TIMEOUT)
-        r.raise_for_status()
-    except (requests.RequestException, OSError) as e:
-        raise UploadError(short_msg(e) or type(e).__name__)
-    text = r.text.strip()
-    if not text.startswith("https://"):
-        raise UploadError(short_msg(text) or "unexpected response")
-    return f"[img]{text}[/img]"
+        with open(file_path, "rb") as f:
+            resp = requests.post(
+                "https://catbox.moe/user/api.php",
+                data={"reqtype": "fileupload"},
+                files={"fileToUpload": f},
+                timeout=30
+            )
+        
+        if resp.status_code == 200 and resp.text.startswith("http"):
+            image_url = resp.text.strip()
+            bbcode = f"[img]{image_url}[/img]"
+            log.append(f"catbox: OK -> {image_url}")
+            return bbcode, log
+        else:
+            log.append(f"catbox: Failed -> HTTP {resp.status_code}: {resp.text.strip()}")
+            return None, log
+            
+    except Exception as e:
+        log.append(f"catbox: Error -> {str(e)}")
+        return None, log
 
+
+# Imgbox is first as the default; if it fails, it falls back to Pixhost, then Catbox.
 UPLOADERS = [upload_imgbox, upload_pixhost, upload_catbox]
 
-def upload_image(f: Path) -> tuple[str | None, list[str]]:
-    log: list[str] = []
-    for up in UPLOADERS:
-        name = up.__name__.removeprefix("upload_")
-        try:
-            bb = up(f)
-        except UploadError as e:
-            log.append(f"    {name}: failed ({e})")
-            continue
-        log.append(f"    {name}: OK")
-        return bb, log
-    log.append("    -> all hosts failed")
-    return None, log
+def upload_image(file_path: Path) -> tuple[str | None, list[str]]:
+    all_logs = []
+    for uploader in UPLOADERS:
+        bbcode, log = uploader(file_path)
+        all_logs.extend(log)
+        if bbcode:
+            return bbcode, all_logs
+    return None, all_logs
