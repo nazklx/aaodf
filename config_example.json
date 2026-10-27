@@ -7,5 +7,6 @@
   "anonymous_upload": false,
   "personal_release": false,
   "stream_optimized": false,
-  "group_separator": "-"
+  "group_separator": "-",
+  "run_as_user": ""
 }

@@ -14,6 +14,7 @@ DEFAULT_CONFIG = {
     "personal_release": False,
     "stream_optimized": False,
     "group_separator": "-",
+    "run_as_user": ""
 }
 
 TYPE_IDS = {
@@ -52,3 +53,4 @@ ANONYMOUS_UPLOAD = config.get("anonymous_upload", False)
 PERSONAL_RELEASE = config.get("personal_release", False)
 STREAM_OPTIMIZED = config.get("stream_optimized", False)
 GROUP_SEPARATOR = config.get("group_separator", "-")
+RUN_AS_USER = config.get("run_as_user", "").strip()
