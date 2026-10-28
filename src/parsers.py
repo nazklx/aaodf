@@ -92,7 +92,12 @@ def simplify_edition(text: str) -> str | None:
         if m := rx.search(text):
             found.append((m.start(), label))
     if found:
-        labels = [label for _, label in sorted(found) if label not in labels]
+        seen = set()
+        labels = []
+        for _, label in sorted(found):
+            if label not in seen:
+                seen.add(label)
+                labels.append(label)
         return " ".join(labels[:2])
     words = [w for w in re.split(r"[ ._-]+", text) if w and w.lower() not in _EDITION_FILLER]
     short = ""
@@ -120,7 +125,12 @@ def parse_edition(raw: str) -> str | None:
         return None
     region = head[start:]
     found = sorted((m.start(), label) for rx, label in _EDITIONS if (m := rx.search(region)))
-    labels = [label for _, label in found if label not in labels]
+    seen = set()
+    labels = []
+    for _, label in found:
+        if label not in seen:
+            seen.add(label)
+            labels.append(label)
     return " ".join(labels[:2]) or None
 
 _HDR_DV_RE = re.compile(_L + r"(?:DV|DoVi|Dolby[ ._-]?Vision)" + _R, re.I)

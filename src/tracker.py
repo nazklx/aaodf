@@ -199,37 +199,45 @@ def post_upload(fields: dict, torrent_path: Path, nfo_path: Path) -> bool:
         print(f"Upload failed: {short_msg(e) or type(e).__name__}")
         return False
     
+    raw_text = r.text.strip()
+    body = None
     try:
         body = r.json()
     except ValueError:
-        body = None
+        body = raw_text
 
-    if r.ok and isinstance(body, dict) and (body.get("success") or r.status_code == 200):
+    success = r.ok
+    if isinstance(body, dict):
+        success = bool(body.get("success", r.ok))
+    elif isinstance(body, str):
+        if any(err in body.lower() for err in ["error", "fail", "unauthorized", "forbidden"]):
+            success = False
+
+    if success:
         print("Upload successful.")
-        
-        # Extract and display the release URL/link from common API response structures
-        url = (
-            body.get("url") or 
-            body.get("link") or 
-            body.get("data", {}).get("url") or 
-            body.get("data", {}).get("link") or
-            body.get("torrent_url") or
-            body.get("data", {}).get("torrent_url")
-        )
-        
-        if url:
-            print(f"Link: {url}")
-        else:
-            # Fallback: print the raw response if a standard URL key wasn't matched
-            print(f"Response data: {body}")
-            
+        if isinstance(body, dict):
+            data = body.get("data")
+            data_dict = data if isinstance(data, dict) else {}
+            url = (
+                body.get("url") or
+                body.get("link") or
+                data_dict.get("url") or
+                data_dict.get("link") or
+                body.get("torrent_url") or
+                data_dict.get("torrent_url")
+            )
+            if not url and isinstance(data, str) and data.strip().startswith(("http://", "https://")):
+                url = data.strip()
+            if url:
+                print(f"Link: {url}")
+            else:
+                print(f"Response data: {body}")
+        elif isinstance(body, str) and body:
+            print(f"Link: {body}")
         return True
 
     print(f"Upload failed (HTTP {r.status_code})")
-    if body:
-        print(f"Response: {body}")
-    else:
-        print(f"Response text: {r.text}")
+    print(f"Response: {body if body else raw_text}")
     return False
 
 def read_key(valid: str, eof: str = "0") -> str:
