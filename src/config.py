@@ -1,8 +1,10 @@
 from __future__ import annotations
 import json
+import os
 from pathlib import Path
 
-CONFIG_FILE = Path("config.json")
+# AAODF_CONFIG lets the web UI run a job with per-job overrides
+CONFIG_FILE = Path(os.environ.get("AAODF_CONFIG") or "config.json")
 
 DEFAULT_CONFIG = {
     "announce_url": "#",
