@@ -1,0 +1,3051 @@
+From 989494a23a2bdcb241394b485865b84ad50d3d97 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 28 Oct 2026 21:15:59 -0400
+Subject: [PATCH 1/2] Add web UI: file browser, job queue, image review/delete,
+ settings
+
+Drives the existing CLI as a subprocess and answers its two prompts
+(review images, confirm upload) from the browser. src/config.py gains an
+AAODF_CONFIG env override so each job can run with its own options.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01QbS6VRfvKUqpr95pyvKWfN
+---
+ README.md               |  15 ++
+ requirements.txt        |   1 +
+ run_web.sh              |  12 +
+ src/config.py           |   4 +-
+ webui/__init__.py       |   0
+ webui/__main__.py       |   3 +
+ webui/app.py            | 321 +++++++++++++++++++++++++++
+ webui/jobs.py           | 477 ++++++++++++++++++++++++++++++++++++++++
+ webui/regen.py          |  32 +++
+ webui/static/app.js     | 428 +++++++++++++++++++++++++++++++++++
+ webui/static/index.html |  30 +++
+ webui/static/style.css  |  99 +++++++++
+ 12 files changed, 1421 insertions(+), 1 deletion(-)
+ create mode 100755 run_web.sh
+ create mode 100644 webui/__init__.py
+ create mode 100644 webui/__main__.py
+ create mode 100644 webui/app.py
+ create mode 100644 webui/jobs.py
+ create mode 100644 webui/regen.py
+ create mode 100644 webui/static/app.js
+ create mode 100644 webui/static/index.html
+ create mode 100644 webui/static/style.css
+
+diff --git a/README.md b/README.md
+index 8b541ac..3fec40e 100644
+--- a/README.md
++++ b/README.md
+@@ -1,3 +1,18 @@
+ 1. Rename config_exmaple.json to config.json and make your changes
+ 2. Execute run.sh without arguments to build venv
+ 3. ./run.sh <File/folder to upload>
++
++## Web UI
++
++    ./run_web.sh [--host 127.0.0.1] [--port 8765] [--root /] [--jobs 1]
++
++Open the URL it prints (it contains a one-time access token). The UI lets you:
++
++- **Files** – browse the filesystem, tick any files/folders and run the script on them. Ticking several makes a batch.
++- **Jobs** – progress per job (frames, review, image hosting, upload), live log, concurrency limit, cancel/retry.
++  A job pauses for you at the "delete unwanted images" step and again before the tracker upload.
++- **Library** – view generated screenshots (lightbox, arrow keys), delete single images or whole output folders.
++- **Settings** – edit `config.json` (secrets are write-only).
++
++Per-run options (review pause, auto-upload, anonymous/personal/stream) are set when queueing and override `config.json` for that job only.
++The server binds to localhost by default; use `--root` to limit what the browser may see. `run_as_user` is ignored by the web UI.
+diff --git a/requirements.txt b/requirements.txt
+index ca3fdff..2833f03 100644
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -1,3 +1,4 @@
+ torf
+ requests
+ pyimgbox
++flask
+diff --git a/run_web.sh b/run_web.sh
+new file mode 100755
+index 0000000..2b33c41
+--- /dev/null
++++ b/run_web.sh
+@@ -0,0 +1,12 @@
++#!/usr/bin/env bash
++# Start the web UI. Usage: ./run_web.sh [--host H] [--port P] [--root DIR] [--jobs N]
++set -euo pipefail
++cd "$(dirname "$0")"
++PYTHON_BIN=".venv/bin/python3"
++if [ ! -x "${PYTHON_BIN}" ]; then
++    echo "Creating virtual environment (.venv)..."
++    python3 -m venv .venv
++fi
++"${PYTHON_BIN}" -m pip install --upgrade pip --quiet
++"${PYTHON_BIN}" -m pip install -r requirements.txt --quiet
++exec "${PYTHON_BIN}" -m webui "$@"
+diff --git a/src/config.py b/src/config.py
+index 7c30d10..e52d18f 100644
+--- a/src/config.py
++++ b/src/config.py
+@@ -1,8 +1,10 @@
+ from __future__ import annotations
+ import json
++import os
+ from pathlib import Path
+ 
+-CONFIG_FILE = Path("config.json")
++# AAODF_CONFIG lets the web UI run a job with per-job overrides
++CONFIG_FILE = Path(os.environ.get("AAODF_CONFIG") or "config.json")
+ 
+ DEFAULT_CONFIG = {
+     "announce_url": "#",
+diff --git a/webui/__init__.py b/webui/__init__.py
+new file mode 100644
+index 0000000..e69de29
+diff --git a/webui/__main__.py b/webui/__main__.py
+new file mode 100644
+index 0000000..b982e5d
+--- /dev/null
++++ b/webui/__main__.py
+@@ -0,0 +1,3 @@
++from .app import main
++
++main()
+diff --git a/webui/app.py b/webui/app.py
+new file mode 100644
+index 0000000..77b62cd
+--- /dev/null
++++ b/webui/app.py
+@@ -0,0 +1,321 @@
++"""Flask web UI for the uploader: file browser, job queue, image library, settings."""
++from __future__ import annotations
++
++import argparse
++import hashlib
++import hmac
++import json
++import os
++import secrets
++import shutil
++import subprocess
++from pathlib import Path
++
++from flask import Flask, Response, abort, jsonify, make_response, redirect, request, send_file, send_from_directory
++
++from .jobs import ACTIVE, OUTPUT, ROOT, STATE_DIR, JobManager, inspect_target
++
++VIDEO_EXTS = {".mkv", ".mp4"}
++SENSITIVE = ("announce_url", "tmdb_api_key", "tracker_api_token", "upload_endpoint")
++BOOL_KEYS = ("confirm_before_upload", "anonymous_upload", "personal_release", "stream_optimized")
++STR_KEYS = ("group_separator", "run_as_user")
++MAX_ENTRIES = 5000
++COOKIE = "aaodf_token"
++
++
++def create_app(fs_root: Path, token: str, max_concurrent: int = 1) -> Flask:
++    app = Flask(__name__, static_folder=str(Path(__file__).parent / "static"), static_url_path="/static")
++    manager = JobManager(max_concurrent)
++    fs_root = fs_root.resolve()
++    OUTPUT.mkdir(exist_ok=True)
++
++    # ---------- auth ----------
++    @app.before_request
++    def guard():
++        if request.endpoint == "static":
++            return None
++        supplied = request.cookies.get(COOKIE) or request.headers.get("X-Token", "")
++        if hmac.compare_digest(supplied, token):
++            if request.method not in ("GET", "HEAD") and not request.is_json:
++                abort(415)  # forces a CORS preflight, blocks cross-site form posts
++            return None
++        if request.method == "GET" and request.path == "/" and hmac.compare_digest(request.args.get("token", ""), token):
++            resp = make_response(redirect("/"))
++            resp.set_cookie(COOKIE, token, httponly=True, samesite="Strict")
++            return resp
++        if request.path == "/":
++            return Response("Open the URL printed in the terminal (it contains ?token=...).", 401)
++        return jsonify(error="unauthorized"), 401
++
++    @app.errorhandler(Exception)
++    def on_error(e):
++        code = getattr(e, "code", 500)
++        if code == 500:
++            app.logger.exception(e)
++        return jsonify(error=getattr(e, "description", str(e))), code if isinstance(code, int) else 500
++
++    @app.get("/")
++    def index():
++        return send_from_directory(app.static_folder, "index.html")
++
++    # ---------- filesystem ----------
++    def safe_path(raw: str) -> Path:
++        p = Path(os.path.realpath(raw or str(fs_root)))
++        if p != fs_root and fs_root not in p.parents:
++            abort(403, f"Outside the allowed root ({fs_root})")
++        return p
++
++    @app.get("/api/fs")
++    def fs_list():
++        p = safe_path(request.args.get("path", str(fs_root)))
++        if not p.is_dir():
++            abort(400, "Not a directory")
++        show_hidden = request.args.get("hidden") == "1"
++        entries, truncated = [], False
++        try:
++            with os.scandir(p) as it:
++                for e in it:
++                    if not show_hidden and e.name.startswith("."):
++                        continue
++                    if len(entries) >= MAX_ENTRIES:
++                        truncated = True
++                        break
++                    try:
++                        st = e.stat()
++                        is_dir = e.is_dir()
++                    except OSError:
++                        continue
++                    entries.append({
++                        "name": e.name, "path": os.path.join(str(p), e.name), "dir": is_dir,
++                        "size": None if is_dir else st.st_size, "mtime": st.st_mtime,
++                        "video": (not is_dir) and Path(e.name).suffix.lower() in VIDEO_EXTS,
++                    })
++        except PermissionError:
++            abort(403, "Permission denied")
++        entries.sort(key=lambda x: (not x["dir"], x["name"].lower()))
++        parent = str(p.parent) if p != fs_root else None
++        return jsonify(path=str(p), parent=parent, root=str(fs_root), entries=entries, truncated=truncated)
++
++    @app.get("/api/inspect")
++    def inspect():
++        return jsonify(inspect_target(safe_path(request.args.get("path", ""))))
++
++    # ---------- jobs ----------
++    @app.get("/api/jobs")
++    def jobs_list():
++        return jsonify(jobs=manager.list(), max_concurrent=manager.max_concurrent)
++
++    @app.post("/api/jobs")
++    def jobs_add():
++        body = request.get_json()
++        paths = [str(safe_path(p)) for p in body.get("paths", [])]
++        if not paths:
++            abort(400, "No paths given")
++        opts = body.get("options", {})
++        clean = {k: bool(opts[k]) for k in ("review", "auto_upload", "anonymous_upload", "personal_release", "stream_optimized") if k in opts}
++        created, skipped = manager.add(paths, clean)
++        return jsonify(created=created, skipped=skipped)
++
++    @app.get("/api/jobs/<jid>")
++    def job_get(jid):
++        j = manager.get(jid) or abort(404, "No such job")
++        return jsonify(j.public(len(manager.logs.get(jid, []))))
++
++    @app.get("/api/jobs/<jid>/log")
++    def job_log(jid):
++        if not manager.get(jid):
++            abort(404, "No such job")
++        since = int(request.args.get("since", 0))
++        return jsonify(lines=manager.log_since(jid, since), since=since)
++
++    def action(fn, *a):
++        err = fn(*a)
++        if err:
++            abort(409, err)
++        return jsonify(ok=True)
++
++    @app.post("/api/jobs/<jid>/proceed")
++    def job_proceed(jid):
++        return action(manager.proceed, jid)
++
++    @app.post("/api/jobs/<jid>/confirm")
++    def job_confirm(jid):
++        return action(manager.confirm, jid, bool(request.get_json().get("go")))
++
++    @app.post("/api/jobs/<jid>/regenerate")
++    def job_regen(jid):
++        return action(manager.regenerate, jid)
++
++    @app.post("/api/jobs/<jid>/cancel")
++    def job_cancel(jid):
++        return jsonify(ok=manager.cancel(jid))
++
++    @app.post("/api/jobs/<jid>/retry")
++    def job_retry(jid):
++        j = manager.retry(jid)
++        if not j:
++            abort(409, "Cannot retry (still active or already queued)")
++        return jsonify(job=j)
++
++    @app.delete("/api/jobs/<jid>")
++    def job_delete(jid):
++        if not manager.remove(jid):
++            abort(409, "Job is still active")
++        return jsonify(ok=True)
++
++    @app.post("/api/jobs/clear")
++    def jobs_clear():
++        return jsonify(removed=manager.clear_finished())
++
++    @app.post("/api/queue")
++    def queue_settings():
++        manager.set_max_concurrent(int(request.get_json().get("max_concurrent", 1)))
++        return jsonify(max_concurrent=manager.max_concurrent)
++
++    # ---------- output library / images ----------
++    def out_dir(name: str) -> Path:
++        if "/" in name or "\\" in name or not name.startswith("UPLOAD."):
++            abort(400, "Bad folder name")
++        p = OUTPUT / name
++        if not p.is_dir():
++            abort(404, "No such output folder")
++        return p
++
++    def image_path(name: str, img: str) -> Path:
++        if "/" in img or "\\" in img or not img.lower().endswith(".png"):
++            abort(400, "Bad image name")
++        p = out_dir(name) / img
++        if not p.is_file():
++            abort(404, "No such image")
++        return p
++
++    def job_for(name: str):
++        return next((j for j in manager.jobs.values() if j.out_dir == name and j.status in ACTIVE), None)
++
++    @app.get("/api/outputs")
++    def outputs_list():
++        items = []
++        for d in OUTPUT.glob("UPLOAD.*"):
++            if not d.is_dir():
++                continue
++            pngs = list(d.glob("*.png"))
++            owner = job_for(d.name)
++            items.append({
++                "name": d.name, "images": len(pngs), "mtime": d.stat().st_mtime,
++                "torrent": any(d.glob("*.torrent")), "job": owner.id if owner else None,
++                "cover": sorted(p.name for p in pngs)[0] if pngs else None,
++            })
++        items.sort(key=lambda x: -x["mtime"])
++        return jsonify(outputs=items)
++
++    @app.get("/api/outputs/<name>/images")
++    def outputs_images(name):
++        d = out_dir(name)
++        imgs = [{"name": p.name, "size": p.stat().st_size, "mtime": p.stat().st_mtime} for p in sorted(d.glob("*.png"))]
++        return jsonify(images=imgs)
++
++    @app.get("/api/outputs/<name>/image/<img>")
++    def outputs_image(name, img):
++        return send_file(image_path(name, img), mimetype="image/png", max_age=0)
++
++    @app.get("/api/outputs/<name>/thumb/<img>")
++    def outputs_thumb(name, img):
++        src = image_path(name, img)
++        st = src.stat()
++        key = hashlib.sha1(f"{src}:{st.st_mtime_ns}:{st.st_size}".encode()).hexdigest()
++        thumb = STATE_DIR / "thumbs" / f"{key}.jpg"
++        if not thumb.exists():
++            thumb.parent.mkdir(parents=True, exist_ok=True)
++            r = subprocess.run(["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-i", str(src),
++                                "-vf", "scale=480:-2", "-q:v", "5", "-frames:v", "1", str(thumb)],
++                               capture_output=True, stdin=subprocess.DEVNULL)
++            if r.returncode != 0 or not thumb.exists():
++                return send_file(src, mimetype="image/png")
++        return send_file(thumb, mimetype="image/jpeg", max_age=3600)
++
++    @app.delete("/api/outputs/<name>/images")
++    def outputs_delete_images(name):
++        d = out_dir(name)
++        owner = job_for(name)
++        if owner and owner.status == "running" and owner.stage not in ("frames",):
++            abort(409, "A job is using these images right now")
++        if owner and owner.regenerating:
++            abort(409, "Frames are being regenerated")
++        deleted = []
++        for img in request.get_json().get("names", []):
++            p = image_path(name, img)
++            p.unlink()
++            deleted.append(img)
++        return jsonify(deleted=deleted, remaining=len(list(d.glob("*.png"))))
++
++    @app.delete("/api/outputs/<name>")
++    def outputs_delete(name):
++        d = out_dir(name)
++        if job_for(name):
++            abort(409, "An active job uses this folder")
++        shutil.rmtree(d)
++        return jsonify(ok=True)
++
++    # ---------- settings ----------
++    from src.config import DEFAULT_CONFIG
++
++    def read_cfg() -> dict:
++        cfg = dict(DEFAULT_CONFIG)
++        try:
++            cfg.update(json.loads((ROOT / "config.json").read_text(encoding="utf-8")))
++        except Exception:
++            pass
++        return cfg
++
++    @app.get("/api/config")
++    def config_get():
++        cfg = read_cfg()
++        out = {k: cfg.get(k) for k in BOOL_KEYS + STR_KEYS}
++        out["secrets"] = {k: bool(str(cfg.get(k, "")).strip() not in ("", "#")) for k in SENSITIVE}
++        return jsonify(out)
++
++    @app.put("/api/config")
++    def config_put():
++        body = request.get_json()
++        cfg = read_cfg()
++        for k in BOOL_KEYS:
++            if k in body:
++                cfg[k] = bool(body[k])
++        for k in STR_KEYS:
++            if k in body:
++                cfg[k] = str(body[k]).strip()
++        for k in SENSITIVE:  # only overwritten when a new value is sent
++            v = body.get("secrets", {}).get(k)
++            if isinstance(v, str) and v.strip():
++                cfg[k] = v.strip()
++        path = ROOT / "config.json"
++        tmp = path.with_suffix(".tmp")
++        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
++        with os.fdopen(fd, "w", encoding="utf-8") as f:
++            json.dump(cfg, f, indent=4)
++        tmp.replace(path)
++        return config_get()
++
++    @app.get("/api/tools")
++    def tools():
++        return jsonify({t: bool(shutil.which(t)) for t in ("ffmpeg", "ffprobe", "mediainfo")})
++
++    return app
++
++
++def main() -> None:
++    ap = argparse.ArgumentParser(description="Web UI for the uploader")
++    ap.add_argument("--host", default="127.0.0.1")
++    ap.add_argument("--port", type=int, default=8765)
++    ap.add_argument("--root", default="/", help="Top-level folder the file browser may access")
++    ap.add_argument("--jobs", type=int, default=1, help="Concurrent jobs (default 1)")
++    a = ap.parse_args()
++    token = os.environ.get("AAODF_WEB_TOKEN") or secrets.token_urlsafe(24)
++    app = create_app(Path(a.root), token, a.jobs)
++    shown = "127.0.0.1" if a.host in ("0.0.0.0", "::") else a.host
++    print(f"\n  Open: http://{shown}:{a.port}/?token={token}\n  (root: {Path(a.root).resolve()})\n", flush=True)
++    app.run(host=a.host, port=a.port, threaded=True)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/webui/jobs.py b/webui/jobs.py
+new file mode 100644
+index 0000000..577517f
+--- /dev/null
++++ b/webui/jobs.py
+@@ -0,0 +1,477 @@
++"""Job queue that drives the existing CLI (`python -m src <target>`) as a subprocess.
++
++The CLI blocks on two stdin prompts (review images, confirm upload). This module
++watches its stdout for those prompts and answers them when the user clicks a
++button in the UI, so none of the pipeline code needs to change.
++"""
++from __future__ import annotations
++
++import json
++import os
++import re
++import signal
++import subprocess
++import sys
++import threading
++import time
++import uuid
++from dataclasses import dataclass, field, asdict
++from pathlib import Path
++
++from src.core import find_videos, episode_videos, episode_info
++
++ROOT = Path(__file__).resolve().parent.parent
++OUTPUT = ROOT / "output"
++STATE_DIR = OUTPUT / ".webui"
++ACTIVE = {"queued", "running", "awaiting_review", "awaiting_confirm"}
++MAX_LOG_LINES = 5000
++
++# Markers printed by the CLI. Kept in one place because the UI depends on them.
++M_REVIEW = "Press ENTER to continue"
++M_PLAN_START = "Upload details:"
++M_PLAN_END = "1) Upload now"
++M_CONFIRM = "0) Cancel"
++
++JOB_OPTION_KEYS = ("anonymous_upload", "personal_release", "stream_optimized")
++
++
++def inspect_target(target: Path) -> dict:
++    """Predict what the CLI will do with `target` (same logic as src/cli.py)."""
++    if not target.exists():
++        return {"ok": False, "error": "Path does not exist"}
++    videos = find_videos(target)
++    if not videos:
++        return {"ok": False, "error": "No .mkv/.mp4 files found"}
++    sources = episode_videos(videos)
++    first = sources[0]
++    multi = len(sources) > 1
++    release = target.name if target.is_dir() else first.stem
++    name = release if multi else first.stem
++    out_dir = f"UPLOAD.{name}"
++    return {
++        "ok": True,
++        "videos": len(videos),
++        "sources": len(sources),
++        "first": first.name,
++        "release": release,
++        "name": name,
++        "out_dir": out_dir,
++        "output_exists": (OUTPUT / out_dir).exists(),
++        "tv": any(episode_info(v) for v in videos),
++    }
++
++
++@dataclass
++class Job:
++    id: str
++    target: str
++    options: dict
++    status: str = "queued"
++    stage: str = "queued"
++    percent: int = 0
++    detail: str = ""
++    created: float = field(default_factory=time.time)
++    started: float | None = None
++    finished: float | None = None
++    name: str | None = None
++    out_dir: str | None = None
++    link: str | None = None
++    uploaded: bool = False
++    error: str | None = None
++    plan: list = field(default_factory=list)
++    frames_total: int = 0
++    frames_done: int = 0
++    hosted: int = 0
++    hosted_total: int = 0
++    exit_code: int | None = None
++    regenerating: bool = False
++
++    def public(self, log_count: int) -> dict:
++        d = asdict(self)
++        d["log_count"] = log_count
++        return d
++
++
++class JobManager:
++    def __init__(self, max_concurrent: int = 1):
++        self.lock = threading.RLock()
++        self.jobs: dict[str, Job] = {}
++        self.order: list[str] = []
++        self.logs: dict[str, list[str]] = {}
++        self.procs: dict[str, subprocess.Popen] = {}
++        self.cancelled: set[str] = set()
++        self.declined: set[str] = set()
++        self.max_concurrent = max_concurrent
++        STATE_DIR.mkdir(parents=True, exist_ok=True)
++        (STATE_DIR / "logs").mkdir(exist_ok=True)
++        self._load()
++
++    # ---------- persistence ----------
++    def _state_file(self) -> Path:
++        return STATE_DIR / "state.json"
++
++    def _save(self) -> None:
++        with self.lock:
++            data = {
++                "max_concurrent": self.max_concurrent,
++                "jobs": [asdict(self.jobs[i]) for i in self.order if i in self.jobs],
++            }
++        tmp = self._state_file().with_suffix(".tmp")
++        tmp.write_text(json.dumps(data), encoding="utf-8")
++        tmp.replace(self._state_file())
++
++    def _load(self) -> None:
++        try:
++            data = json.loads(self._state_file().read_text(encoding="utf-8"))
++        except Exception:
++            return
++        self.max_concurrent = int(data.get("max_concurrent", self.max_concurrent))
++        for d in data.get("jobs", []):
++            try:
++                j = Job(**d)
++            except TypeError:
++                continue
++            if j.status in ACTIVE:
++                j.status, j.stage, j.error = "interrupted", "interrupted", "Server restarted while this job was active"
++                j.finished = time.time()
++            self.jobs[j.id] = j
++            self.order.append(j.id)
++            lf = STATE_DIR / "logs" / f"{j.id}.log"
++            try:
++                self.logs[j.id] = lf.read_text(encoding="utf-8", errors="replace").splitlines()[-MAX_LOG_LINES:]
++            except OSError:
++                self.logs[j.id] = []
++
++    # ---------- public API ----------
++    def list(self) -> list[dict]:
++        with self.lock:
++            return [self.jobs[i].public(len(self.logs.get(i, []))) for i in reversed(self.order)]
++
++    def get(self, job_id: str) -> Job | None:
++        return self.jobs.get(job_id)
++
++    def log_since(self, job_id: str, since: int) -> list[str]:
++        with self.lock:
++            return self.logs.get(job_id, [])[since:]
++
++    def add(self, paths: list[str], options: dict) -> tuple[list[dict], list[str]]:
++        created, skipped = [], []
++        with self.lock:
++            busy = {j.target for j in self.jobs.values() if j.status in ACTIVE}
++            for p in paths:
++                if p in busy:
++                    skipped.append(p)
++                    continue
++                job = Job(id=uuid.uuid4().hex[:10], target=p, options=dict(options))
++                self.jobs[job.id] = job
++                self.order.append(job.id)
++                self.logs[job.id] = []
++                busy.add(p)
++                created.append(job.public(0))
++        self._save()
++        self._pump()
++        return created, skipped
++
++    def set_max_concurrent(self, n: int) -> None:
++        self.max_concurrent = max(1, min(8, n))
++        self._save()
++        self._pump()
++
++    def cancel(self, job_id: str) -> bool:
++        with self.lock:
++            job = self.jobs.get(job_id)
++            if not job or job.status not in ACTIVE:
++                return False
++            self.cancelled.add(job_id)
++            proc = self.procs.get(job_id)
++            if job.status == "queued":
++                self._finish(job, "cancelled", "Cancelled while queued")
++        if proc:
++            self._kill(proc)
++        self._save()
++        return True
++
++    def retry(self, job_id: str) -> dict | None:
++        job = self.jobs.get(job_id)
++        if not job or job.status in ACTIVE:
++            return None
++        created, _ = self.add([job.target], job.options)
++        return created[0] if created else None
++
++    def remove(self, job_id: str) -> bool:
++        with self.lock:
++            job = self.jobs.get(job_id)
++            if not job or job.status in ACTIVE:
++                return False
++            self.jobs.pop(job_id)
++            self.order.remove(job_id)
++            self.logs.pop(job_id, None)
++        (STATE_DIR / "logs" / f"{job_id}.log").unlink(missing_ok=True)
++        self._save()
++        return True
++
++    def clear_finished(self) -> int:
++        with self.lock:
++            ids = [i for i in self.order if self.jobs[i].status not in ACTIVE]
++        return sum(self.remove(i) for i in ids)
++
++    def proceed(self, job_id: str) -> str | None:
++        """Answer the review prompt (ENTER). Returns an error string or None."""
++        with self.lock:
++            job = self.jobs.get(job_id)
++            if not job or job.status != "awaiting_review":
++                return "Job is not waiting for review"
++            if job.regenerating:
++                return "Frames are still being regenerated"
++            if not any((OUTPUT / (job.out_dir or "")).glob("*.png")):
++                return "No images left - regenerate frames or cancel the job"
++            job.status, job.stage = "running", "hosting"
++            self._write(job_id, "\n")
++        self._save()
++        return None
++
++    def confirm(self, job_id: str, go: bool) -> str | None:
++        with self.lock:
++            job = self.jobs.get(job_id)
++            if not job or job.status != "awaiting_confirm":
++                return "Job is not waiting for upload confirmation"
++            if go:
++                job.status, job.stage, job.error = "running", "uploading", None
++            else:
++                self.declined.add(job_id)
++                job.status, job.stage = "running", "finalize"
++            self._write(job_id, "1\n" if go else "0\n")
++        self._save()
++        return None
++
++    def regenerate(self, job_id: str) -> str | None:
++        with self.lock:
++            job = self.jobs.get(job_id)
++            if not job or job.status != "awaiting_review":
++                return "Job is not waiting for review"
++            if job.regenerating:
++                return "Already regenerating"
++            job.regenerating = True
++        threading.Thread(target=self._regen_worker, args=(job_id,), daemon=True).start()
++        return None
++
++    # ---------- internals ----------
++    def _write(self, job_id: str, text: str) -> None:
++        proc = self.procs.get(job_id)
++        if proc and proc.stdin:
++            try:
++                proc.stdin.write(text)
++                proc.stdin.flush()
++            except OSError:
++                pass
++
++    @staticmethod
++    def _kill(proc: subprocess.Popen) -> None:
++        try:
++            os.killpg(proc.pid, signal.SIGTERM)
++        except (ProcessLookupError, PermissionError):
++            pass
++
++    def _running_count(self) -> int:
++        # Jobs waiting on the user do not hold a slot, so a batch keeps moving.
++        return sum(1 for j in self.jobs.values() if j.status == "running")
++
++    def _pump(self) -> None:
++        with self.lock:
++            for jid in self.order:
++                if self._running_count() >= self.max_concurrent:
++                    break
++                job = self.jobs[jid]
++                if job.status == "queued":
++                    job.status, job.stage, job.started = "running", "starting", time.time()
++                    job.percent = 2
++                    threading.Thread(target=self._run, args=(jid,), daemon=True).start()
++        self._save()
++
++    def _finish(self, job: Job, status: str, error: str | None = None) -> None:
++        job.status, job.finished = status, time.time()
++        job.stage = status
++        if status in ("finished",) and job.uploaded:
++            job.percent = 100
++        if error:
++            job.error = error
++
++    def _append(self, jid: str, line: str) -> None:
++        buf = self.logs.setdefault(jid, [])
++        buf.append(line)
++        if len(buf) > MAX_LOG_LINES:
++            del buf[: len(buf) - MAX_LOG_LINES]
++        try:
++            with open(STATE_DIR / "logs" / f"{jid}.log", "a", encoding="utf-8") as f:
++                f.write(line + "\n")
++        except OSError:
++            pass
++
++    def _config_for(self, job: Job) -> Path:
++        from src.config import DEFAULT_CONFIG, CONFIG_FILE
++        cfg = dict(DEFAULT_CONFIG)
++        try:
++            cfg.update(json.loads(Path(ROOT / "config.json").read_text(encoding="utf-8")))
++        except Exception:
++            pass
++        for k in JOB_OPTION_KEYS:
++            if k in job.options:
++                cfg[k] = bool(job.options[k])
++        # Without auto-upload the CLI shows its confirm prompt, which the UI answers.
++        cfg["confirm_before_upload"] = not job.options.get("auto_upload", False)
++        path = STATE_DIR / f"cfg-{job.id}.json"
++        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
++        with os.fdopen(fd, "w", encoding="utf-8") as f:
++            json.dump(cfg, f)
++        return path
++
++    def _run(self, jid: str) -> None:
++        job = self.jobs[jid]
++        cfg_path = None
++        try:
++            info = inspect_target(Path(job.target))
++            if not info["ok"]:
++                with self.lock:
++                    self._append(jid, f"Error: {info['error']}: {job.target}")
++                    self._finish(job, "failed", info["error"])
++                return
++            with self.lock:
++                clash = next((j for j in self.jobs.values() if j.id != jid and j.out_dir == info["out_dir"]
++                              and j.status in ACTIVE), None)
++                if clash:
++                    self._append(jid, f"Error: output folder {info['out_dir']} is in use by another active job")
++                    self._finish(job, "failed", "Output folder is used by another active job")
++                    return
++                job.name, job.out_dir = info["name"], info["out_dir"]
++                if jid in self.cancelled:
++                    self._finish(job, "cancelled", "Cancelled")
++                    return
++            cfg_path = self._config_for(job)
++            env = dict(os.environ, PYTHONUNBUFFERED="1", PYTHONPATH="src", AAODF_CONFIG=str(cfg_path))
++            proc = subprocess.Popen(
++                [sys.executable, "-m", "src", job.target], cwd=ROOT, env=env,
++                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
++                text=True, encoding="utf-8", errors="replace", bufsize=1, start_new_session=True,
++            )
++            with self.lock:
++                self.procs[jid] = proc
++                if jid in self.cancelled:
++                    self._kill(proc)
++            for raw in proc.stdout:
++                with self.lock:
++                    self._on_line(job, raw.rstrip("\r\n"))
++            rc = proc.wait()
++            with self.lock:
++                job.exit_code = rc
++                if jid in self.cancelled:
++                    self._finish(job, "cancelled", "Cancelled")
++                elif rc != 0:
++                    self._finish(job, "failed", job.error or self._last_line(jid) or f"Exited with code {rc}")
++                elif job.uploaded:
++                    self._finish(job, "finished")
++                else:
++                    reason = "Upload declined" if jid in self.declined else (job.error or "Ended without uploading")
++                    self._finish(job, "finished", reason)
++        except Exception as e:  # noqa: BLE001 - surface any launcher error in the UI
++            with self.lock:
++                self._append(jid, f"Error: {e}")
++                self._finish(job, "failed", str(e))
++        finally:
++            with self.lock:
++                self.procs.pop(jid, None)
++            if cfg_path:
++                cfg_path.unlink(missing_ok=True)
++            self._save()
++            self._pump()
++
++    def _last_line(self, jid: str) -> str:
++        for line in reversed(self.logs.get(jid, [])):
++            if line.strip():
++                return line.strip()[:300]
++        return ""
++
++    def _on_line(self, job: Job, line: str) -> None:
++        jid = job.id
++        self._append(jid, line)
++        s = line.strip()
++        changed = False
++
++        if m := re.match(r"Extracting (\d+) ", s):
++            job.stage, job.frames_total, job.frames_done = "frames", int(m.group(1)), 0
++            changed = True
++        elif re.match(r"Frame\s+\d+/\d+ .*: (done|FAILED)$", s):
++            job.frames_done += 1
++        elif s.startswith("Extracted ") and " frames to" in s:
++            job.detail = s
++        elif M_REVIEW in s:
++            if job.options.get("review", True):
++                job.status, job.stage = "awaiting_review", "review"
++                changed = True
++            else:
++                job.stage = "hosting"
++                self._write(job.id, "\n")
++        elif m := re.match(r"\[(\d+)/(\d+)\] ", s):
++            job.stage, job.hosted, job.hosted_total = "hosting", int(m.group(1)) - 1, int(m.group(2))
++            changed = True
++        elif m := re.match(r"Uploaded (\d+)/(\d+) images", s):
++            job.hosted, job.hosted_total = int(m.group(1)), int(m.group(2))
++        elif s.startswith("No PNG files found"):
++            job.error = "No images to upload"
++        elif s.startswith("TORRENT DETAILS"):
++            job.stage = "finalize"
++            changed = True
++        elif s.startswith(("Searching TMDB", "Matched on TMDB", "No TMDB match")):
++            job.stage, job.detail = "finalize", s
++            changed = True
++        elif s.startswith("Generating nfo"):
++            job.stage = "uploading"
++            changed = True
++        elif s.startswith(M_PLAN_START):
++            job.plan = []
++            job._collecting = True  # type: ignore[attr-defined]
++        elif M_PLAN_END in s:
++            job._collecting = False  # type: ignore[attr-defined]
++        elif M_CONFIRM in s:
++            job.status, job.stage = "awaiting_confirm", "confirm"
++            changed = True
++        elif getattr(job, "_collecting", False) and s:
++            job.plan.append(s)
++        elif s.startswith("Upload successful"):
++            job.uploaded = True
++            job.error = None
++        elif s.startswith("Link:"):
++            job.link = s.split(":", 1)[1].strip()
++        elif s.startswith(("Upload failed", "Response:")):
++            job.error = s[:300]
++        elif s.endswith("skipping tracker upload.") or s.startswith("Error:"):
++            job.error = s[:300]
++
++        job.percent = self._percent(job)
++        if changed:
++            self._save()
++
++    @staticmethod
++    def _percent(j: Job) -> int:
++        frac = lambda a, b: (min(a, b) / b) if b else 0
++        return {
++            "queued": 0, "starting": 2,
++            "frames": 5 + int(35 * frac(j.frames_done, j.frames_total)),
++            "review": 40,
++            "hosting": 40 + int(40 * frac(j.hosted, j.hosted_total)),
++            "finalize": 85, "confirm": 92, "uploading": 96,
++        }.get(j.stage, j.percent)
++
++    def _regen_worker(self, jid: str) -> None:
++        job = self.jobs[jid]
++        try:
++            cmd = [sys.executable, "-m", "webui.regen", job.target, "--name", job.name or "", "--out", str(OUTPUT / (job.out_dir or ""))]
++            proc = subprocess.Popen(cmd, cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
++                                    encoding="utf-8", errors="replace", stdin=subprocess.DEVNULL,
++                                    env=dict(os.environ, PYTHONUNBUFFERED="1"))
++            for line in proc.stdout:
++                with self.lock:
++                    self._append(jid, "[regen] " + line.rstrip())
++            proc.wait()
++        finally:
++            with self.lock:
++                job.regenerating = False
+diff --git a/webui/regen.py b/webui/regen.py
+new file mode 100644
+index 0000000..6ee2a7e
+--- /dev/null
++++ b/webui/regen.py
+@@ -0,0 +1,32 @@
++"""Re-extract screenshots for a job that is waiting for review.
++
++Mirrors tracker.make_screenshots(): remove old PNGs, then extract with jitter so
++single-video releases get different timestamps.
++"""
++from __future__ import annotations
++
++import argparse
++from pathlib import Path
++
++from src.core import extract_frames, find_videos, episode_videos
++
++
++def main() -> int:
++    ap = argparse.ArgumentParser()
++    ap.add_argument("target")
++    ap.add_argument("--name", required=True)
++    ap.add_argument("--out", required=True)
++    a = ap.parse_args()
++    out = Path(a.out)
++    sources = episode_videos(find_videos(Path(a.target)))
++    if not sources:
++        print("No videos found")
++        return 1
++    for old in out.glob("*.png"):
++        old.unlink()
++    extract_frames(sources, a.name, out, jitter=True)
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/webui/static/app.js b/webui/static/app.js
+new file mode 100644
+index 0000000..b975c94
+--- /dev/null
++++ b/webui/static/app.js
+@@ -0,0 +1,428 @@
++"use strict";
++// All DOM is built with h() + textContent, so file names can never inject markup.
++
++const $ = (s) => document.querySelector(s);
++
++function h(tag, attrs, ...kids) {
++  const el = document.createElement(tag);
++  for (const [k, v] of Object.entries(attrs || {})) {
++    if (v === false || v == null) continue;
++    if (k === "class") el.className = v;
++    else if (k.startsWith("on")) el.addEventListener(k.slice(2), v);
++    else if (k in el) el[k] = v;
++    else el.setAttribute(k, v);
++  }
++  for (const kid of kids.flat()) {
++    if (kid == null || kid === false) continue;
++    el.append(kid.nodeType ? kid : document.createTextNode(String(kid)));
++  }
++  return el;
++}
++
++// Let `cond && h(...)` work in replaceChildren() too: drop false/null and flatten arrays.
++const _replaceChildren = Element.prototype.replaceChildren;
++Element.prototype.replaceChildren = function (...kids) {
++  _replaceChildren.apply(this, kids.flat().filter((k) => k != null && k !== false));
++};
++
++async function api(method, url, body) {
++  const r = await fetch(url, {
++    method, credentials: "same-origin",
++    headers: body !== undefined ? { "Content-Type": "application/json" } : { "Accept": "application/json" },
++    body: body !== undefined ? JSON.stringify(body) : undefined,
++  });
++  let data = {};
++  try { data = await r.json(); } catch (_) { /* non-JSON */ }
++  if (!r.ok) throw new Error(data.error || `HTTP ${r.status}`);
++  return data;
++}
++
++let toastTimer;
++function toast(msg, bad) {
++  const t = $("#toast");
++  t.textContent = msg; t.hidden = false; t.style.background = bad ? "var(--bad)" : "";
++  clearTimeout(toastTimer);
++  toastTimer = setTimeout(() => (t.hidden = true), 3500);
++}
++const guard = (fn) => async (...a) => { try { await fn(...a); } catch (e) { toast(e.message, true); } };
++
++const fmtSize = (n) => {
++  if (n == null) return "";
++  const u = ["B", "KiB", "MiB", "GiB", "TiB"]; let i = 0;
++  while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
++  return (i ? n.toFixed(1) : n) + " " + u[i];
++};
++const fmtTime = (t) => t ? new Date(t * 1000).toLocaleString([], { dateStyle: "short", timeStyle: "short" }) : "";
++const enc = encodeURIComponent;
++
++const state = {
++  tab: "files", fs: null, hidden: false, filter: "", selected: new Map(),
++  jobs: [], maxConc: 1, openJob: null, config: null, lib: null,
++};
++
++/* ---------------- lightbox ---------------- */
++const lb = { dir: null, list: [], i: 0, onDelete: null };
++function openLightbox(dir, list, i, onDelete) {
++  Object.assign(lb, { dir, list, i, onDelete });
++  drawLightbox();
++}
++function drawLightbox() {
++  const box = $("#lightbox");
++  const img = lb.list[lb.i];
++  if (!img) { box.hidden = true; return; }
++  box.hidden = false; box.replaceChildren(
++    h("img", { src: `/api/outputs/${enc(lb.dir)}/image/${enc(img.name)}?v=${img.mtime}`, alt: img.name }),
++    h("div", { class: "bar2" },
++      h("button", { class: "btn", onclick: (e) => { e.stopPropagation(); step(-1); } }, "‹ Prev"),
++      h("span", {}, `${lb.i + 1} / ${lb.list.length} · ${img.name} · ${fmtSize(img.size)}`),
++      h("button", { class: "btn", onclick: (e) => { e.stopPropagation(); step(1); } }, "Next ›"),
++      lb.onDelete && h("button", { class: "btn danger fill", onclick: (e) => { e.stopPropagation(); delCurrent(); } }, "Delete"),
++      h("button", { class: "btn", onclick: closeLightbox }, "Close")));
++}
++const step = (d) => { lb.i = (lb.i + d + lb.list.length) % lb.list.length; drawLightbox(); };
++const closeLightbox = () => { $("#lightbox").hidden = true; };
++const delCurrent = guard(async () => {
++  const img = lb.list[lb.i];
++  await lb.onDelete([img.name]);
++  lb.list.splice(lb.i, 1);
++  if (lb.i >= lb.list.length) lb.i = 0;
++  drawLightbox();
++});
++$("#lightbox").addEventListener("click", (e) => { if (e.target.id === "lightbox") closeLightbox(); });
++document.addEventListener("keydown", (e) => {
++  if ($("#lightbox").hidden) return;
++  if (e.key === "Escape") closeLightbox();
++  else if (e.key === "ArrowRight") step(1);
++  else if (e.key === "ArrowLeft") step(-1);
++  else if (e.key === "Delete" && lb.onDelete) delCurrent();
++});
++
++/* ---------------- gallery (used by job detail and library) ---------------- */
++function Gallery(dir, { editable = true } = {}) {
++  const sel = new Set();
++  let images = [], sig = "";
++  const root = h("div");
++  const actions = h("div", { class: "row" });
++  const grid = h("div", { class: "grid" });
++  root.append(actions, grid);
++
++  async function del(names) {
++    await api("DELETE", `/api/outputs/${enc(dir)}/images`, { names });
++    names.forEach((n) => sel.delete(n));
++    await refresh(true);
++  }
++  function draw() {
++    actions.replaceChildren(
++      h("span", { class: "muted" }, `${images.length} image${images.length === 1 ? "" : "s"}`),
++      editable && h("button", { class: "btn small", onclick: () => { images.forEach((i) => sel.add(i.name)); draw(); } }, "Select all"),
++      editable && h("button", { class: "btn small", onclick: () => { sel.clear(); draw(); } }, "Clear"),
++      editable && h("button", {
++        class: "btn danger small", disabled: !sel.size,
++        onclick: guard(async () => { if (confirm(`Delete ${sel.size} image(s)? This cannot be undone.`)) await del([...sel]); }),
++      }, `Delete selected (${sel.size})`));
++    grid.replaceChildren(...images.map((img, idx) => h("div", { class: "card" + (sel.has(img.name) ? " sel" : "") },
++      editable && h("input", { type: "checkbox", checked: sel.has(img.name), onchange: (e) => { e.target.checked ? sel.add(img.name) : sel.delete(img.name); draw(); } }),
++      h("img", { loading: "lazy", src: `/api/outputs/${enc(dir)}/thumb/${enc(img.name)}?v=${img.mtime}`, alt: img.name,
++        onclick: () => openLightbox(dir, images, idx, editable ? (names) => del(names) : null) }),
++      h("div", { class: "cap" }, h("span", {}, img.name.replace(/^.*_frame_/, "frame ").replace(".png", "")), h("span", {}, fmtSize(img.size))))));
++    if (!images.length) grid.replaceChildren(h("div", { class: "empty" }, "No images"));
++  }
++  async function refresh(force) {
++    const { images: list } = await api("GET", `/api/outputs/${enc(dir)}/images`);
++    const s = list.map((i) => i.name + i.mtime).join("|");
++    images = list;
++    for (const n of [...sel]) if (!list.some((i) => i.name === n)) sel.delete(n);
++    if (force || s !== sig) { sig = s; draw(); }
++  }
++  refresh(true).catch((e) => toast(e.message, true));
++  return { el: root, refresh: () => refresh(false).catch(() => {}) };
++}
++
++/* ---------------- FILES tab ---------------- */
++const files = { list: h("div"), crumbs: h("div", { class: "crumbs" }), tray: h("div", { class: "panel tray" }), path: null, inspect: {}, opts: null };
++
++function buildFiles() {
++  const root = $("#tab-files");
++  files.path = h("input", { type: "text", class: "grow", onkeydown: (e) => { if (e.key === "Enter") goto(e.target.value); } });
++  const filter = h("input", { type: "text", placeholder: "Filter…", oninput: (e) => { state.filter = e.target.value.toLowerCase(); drawList(); } });
++  root.append(
++    h("div", { class: "files-layout" },
++      h("div", { class: "panel" },
++        h("div", { class: "row" },
++          h("button", { class: "btn", title: "Up", onclick: () => state.fs && state.fs.parent && goto(state.fs.parent) }, "↑ Up"),
++          files.path,
++          h("button", { class: "btn", onclick: () => goto(state.fs.path) }, "Refresh"),
++          h("label", { class: "chk small" }, h("input", { type: "checkbox", onchange: (e) => { state.hidden = e.target.checked; goto(state.fs.path); } }), "Hidden"),
++          filter),
++        h("div", { class: "spacer" }), files.crumbs,
++        h("div", { class: "fs-scroll" }, files.list)),
++      files.tray));
++  goto(null);
++}
++
++const goto = guard(async (path) => {
++  const q = new URLSearchParams({ hidden: state.hidden ? "1" : "0" });
++  if (path) q.set("path", path);
++  state.fs = await api("GET", "/api/fs?" + q);
++  files.path.value = state.fs.path;
++  drawCrumbs(); drawList(); drawTray();
++});
++
++function drawCrumbs() {
++  const { path, root } = state.fs;
++  const rel = path.startsWith(root) ? path.slice(root.length) : path;
++  const parts = rel.split("/").filter(Boolean);
++  let acc = root.replace(/\/$/, "");
++  files.crumbs.replaceChildren(h("button", { onclick: () => goto(root) }, root === "/" ? "/" : root),
++    ...parts.flatMap((p) => { acc += "/" + p; const target = acc; return [h("span", { class: "muted" }, "/"), h("button", { onclick: () => goto(target) }, p)]; }));
++}
++
++function visibleEntries() {
++  return state.fs.entries.filter((e) => !state.filter || e.name.toLowerCase().includes(state.filter));
++}
++
++function toggleSel(e, on) {
++  const want = on ?? !state.selected.has(e.path);
++  want ? state.selected.set(e.path, e.name) : state.selected.delete(e.path);
++}
++
++function drawList() {
++  const rows = visibleEntries();
++  const allOn = rows.length && rows.every((e) => state.selected.has(e.path));
++  files.list.replaceChildren(h("table", { class: "fs" },
++    h("thead", {}, h("tr", {},
++      h("th", {}, h("input", { type: "checkbox", checked: !!allOn, onchange: (ev) => { rows.forEach((e) => toggleSel(e, ev.target.checked)); drawList(); drawTray(); } })),
++      h("th", {}, "Name"), h("th", {}, "Size"), h("th", {}, "Modified"))),
++    h("tbody", {}, rows.map((e) => h("tr", { class: state.selected.has(e.path) ? "sel" : "" },
++      h("td", {}, h("input", { type: "checkbox", checked: state.selected.has(e.path), onchange: () => { toggleSel(e); drawList(); drawTray(); } })),
++      h("td", { class: "name" }, e.dir
++        ? h("button", { class: "link dir", onclick: () => goto(e.path) }, "📁 " + e.name)
++        : h("button", { class: "link", onclick: () => { toggleSel(e); drawList(); drawTray(); } }, (e.video ? "🎞 " : "📄 ") + e.name),
++        e.video && h("span", { class: "tag" }, "video")),
++      h("td", { class: "num" }, fmtSize(e.size)), h("td", { class: "num" }, fmtTime(e.mtime))))),
++    ),
++    !rows.length && h("div", { class: "empty" }, "Empty"),
++    state.fs.truncated && h("div", { class: "muted small" }, "Showing the first 5000 entries only."));
++}
++
++function cfgDefaults() {
++  const c = state.config || {};
++  return { review: true, auto_upload: c.confirm_before_upload === false, anonymous_upload: !!c.anonymous_upload, personal_release: !!c.personal_release, stream_optimized: !!c.stream_optimized };
++}
++
++function drawTray() {
++  files.opts = files.opts || cfgDefaults();
++  const o = files.opts;
++  const opt = (key, label, hint) => h("label", { class: "chk", title: hint || "" }, h("input", { type: "checkbox", checked: o[key], onchange: (e) => { o[key] = e.target.checked; drawTray(); } }), label);
++  const n = state.selected.size;
++  files.tray.replaceChildren(
++    h("h2", {}, `Selection (${n})`),
++    n ? h("ul", {}, [...state.selected].map(([p]) => h("li", {},
++      h("button", { class: "btn small", title: "Remove", onclick: () => { state.selected.delete(p); drawList(); drawTray(); } }, "✕"),
++      h("span", { title: p }, "‎" + p)))) : h("p", { class: "muted" }, "Tick files or folders (a video file, or a release folder) to run the script on."),
++    ...[...state.selected.keys()].filter((p) => files.inspect[p]).map((p) => h("div", { class: "insp" }, describe(p, files.inspect[p]))),
++    h("div", { class: "opts" },
++      opt("review", "Pause to review images before they are hosted", "Matches the CLI's ‘delete unwanted images’ pause"),
++      opt("auto_upload", "Upload to tracker without asking", "Skips the final confirmation"),
++      opt("anonymous_upload", "Anonymous upload"), opt("personal_release", "Personal release"), opt("stream_optimized", "Stream optimised")),
++    (!o.review && o.auto_upload) && h("div", { class: "notice small" }, "Fully unattended: images and the release go out without any prompt."),
++    h("div", { class: "row" },
++      h("button", { class: "btn", disabled: !n, onclick: guard(inspectAll) }, "Inspect"),
++      h("button", { class: "btn", disabled: !n, onclick: () => { state.selected.clear(); drawList(); drawTray(); } }, "Clear"),
++      h("button", { class: "btn primary", disabled: !n, onclick: guard(queueSelected) }, n > 1 ? `Queue ${n} as batch` : "Run")));
++}
++
++function describe(p, i) {
++  if (!i.ok) return `${p.split("/").pop()}: ${i.error}`;
++  return `${i.name} → ${i.sources} source video(s) of ${i.videos}${i.tv ? ", TV" : ""}; output ${i.out_dir}${i.output_exists ? " (exists, will be overwritten)" : ""}`;
++}
++
++async function inspectAll() {
++  for (const p of state.selected.keys()) {
++    files.inspect[p] = await api("GET", "/api/inspect?path=" + enc(p)).catch((e) => ({ ok: false, error: e.message }));
++    drawTray();
++  }
++}
++
++async function queueSelected() {
++  const r = await api("POST", "/api/jobs", { paths: [...state.selected.keys()], options: files.opts });
++  toast(`Queued ${r.created.length}` + (r.skipped.length ? `, skipped ${r.skipped.length} already active` : ""));
++  state.selected.clear(); files.inspect = {}; drawList(); drawTray();
++  switchTab("jobs");
++}
++
++/* ---------------- JOBS tab ---------------- */
++const jobsUI = { list: h("div"), detail: h("div"), toolbar: h("div", { class: "row" }), logEl: null, logCount: 0, logJob: null, gallery: null, galleryDir: null, sig: "" };
++const STEPS = ["Frames", "Review", "Images", "Finalize", "Upload"];
++const STAGE_IDX = { starting: 0, frames: 0, review: 1, hosting: 2, finalize: 3, confirm: 4, uploading: 4 };
++const STATUS_TEXT = { queued: "Queued", running: "Running", awaiting_review: "Needs review", awaiting_confirm: "Confirm upload", finished: "Finished", failed: "Failed", cancelled: "Cancelled", interrupted: "Interrupted" };
++const isActive = (j) => ["queued", "running", "awaiting_review", "awaiting_confirm"].includes(j.status);
++
++function buildJobs() {
++  $("#tab-jobs").append(jobsUI.toolbar, h("div", { class: "spacer" }),
++    h("div", { class: "jobs-layout" }, jobsUI.list, jobsUI.detail));
++}
++
++function drawJobsToolbar() {
++  jobsUI.toolbar.replaceChildren(
++    h("label", { class: "chk" }, "Run up to ",
++      h("input", { type: "number", min: 1, max: 8, value: state.maxConc, onchange: guard(async (e) => { await api("POST", "/api/queue", { max_concurrent: +e.target.value }); }) }), " at once"),
++    h("span", { class: "muted small" }, "Jobs waiting for you do not use a slot."),
++    h("span", { class: "grow" }),
++    h("button", { class: "btn", onclick: guard(async () => { await api("POST", "/api/jobs/clear", {}); await refreshJobs(); }) }, "Clear finished"));
++}
++
++function drawJobsList() {
++  const jobs = state.jobs;
++  jobsUI.list.replaceChildren(...(jobs.length ? jobs.map((j) => h("div", { class: "job " + j.status + (state.openJob === j.id ? " open" : ""), onclick: () => { state.openJob = j.id; drawJobsList(); drawJobDetail(true); } },
++    h("div", { class: "row" }, h("div", { class: "title grow", title: j.target }, j.name || j.target.split("/").pop()), h("span", { class: "pill " + j.status }, STATUS_TEXT[j.status] || j.status)),
++    h("div", { class: "bar" }, h("div", { style: `width:${j.status === "finished" && j.uploaded ? 100 : j.percent}%` })),
++    h("div", { class: "muted small" }, jobLine(j)))) : [h("div", { class: "empty" }, "No jobs yet. Pick files on the Files tab.")]));
++}
++
++function jobLine(j) {
++  if (j.status === "failed" || j.status === "interrupted") return j.error || "";
++  if (j.status === "finished") return j.uploaded ? "Uploaded" + (j.link ? " · " + j.link : "") : j.error || "Ended without upload";
++  if (j.stage === "frames") return `Extracting frames ${j.frames_done}/${j.frames_total || "?"}`;
++  if (j.stage === "hosting") return `Hosting images ${j.hosted}/${j.hosted_total || "?"}`;
++  return j.status === "queued" ? "Waiting for a free slot" : (j.detail || j.stage);
++}
++
++function drawJobDetail(force) {
++  const j = state.jobs.find((x) => x.id === state.openJob);
++  if (!j) { jobsUI.detail.replaceChildren(h("div", { class: "panel muted" }, "Select a job to see progress, images and the log.")); jobsUI.logJob = null; jobsUI.galleryDir = null; return; }
++  const sig = JSON.stringify([j.id, j.status, j.stage, j.regenerating, j.plan, j.error, j.link, Math.floor(j.percent / 5)]);
++  const hasImages = j.out_dir && ["frames", "review", "hosting", "finalize", "confirm", "uploading", "finished", "failed", "cancelled"].includes(j.stage) || (j.out_dir && !isActive(j));
++  if (force || sig !== jobsUI.sig || jobsUI.logJob !== j.id) {
++    jobsUI.sig = sig;
++    const cur = STAGE_IDX[j.stage] ?? -1;
++    const done = j.status === "finished";
++    if (jobsUI.galleryDir !== j.out_dir || force) {
++      jobsUI.gallery = hasImages ? Gallery(j.out_dir, { editable: j.status === "awaiting_review" || !isActive(j) }) : null;
++      jobsUI.galleryDir = j.out_dir;
++    }
++    jobsUI.logEl = h("pre", { class: "log" });
++    jobsUI.logCount = 0; jobsUI.logJob = j.id;
++    jobsUI.detail.replaceChildren(h("div", { class: "panel" },
++      h("div", { class: "row" }, h("h2", { class: "grow" }, j.name || j.target), h("span", { class: "pill " + j.status }, STATUS_TEXT[j.status])),
++      h("div", { class: "muted small", style: "word-break:break-all" }, j.target),
++      h("div", { class: "bar" }, h("div", { style: `width:${done && j.uploaded ? 100 : j.percent}%` })),
++      h("div", { class: "steps" }, STEPS.map((s, i) => h("span", { class: done ? "past" : i < cur ? "past" : i === cur && isActive(j) ? "now" : "" }, s))),
++      j.error && h("div", { class: "err" }, j.error),
++      j.link && h("div", {}, "Link: ", h("a", { href: j.link, target: "_blank", rel: "noreferrer noopener" }, j.link)),
++      reviewControls(j), confirmControls(j),
++      h("div", { class: "row" },
++        isActive(j) && h("button", { class: "btn danger", onclick: guard(async () => { if (confirm("Cancel this job?")) { await api("POST", `/api/jobs/${j.id}/cancel`, {}); await refreshJobs(); } }) }, "Cancel job"),
++        !isActive(j) && h("button", { class: "btn", onclick: guard(async () => { await api("POST", `/api/jobs/${j.id}/retry`, {}); await refreshJobs(); }) }, "Run again"),
++        !isActive(j) && h("button", { class: "btn", onclick: guard(async () => { await api("DELETE", `/api/jobs/${j.id}`); state.openJob = null; await refreshJobs(); }) }, "Remove from list")),
++      jobsUI.gallery && h("div", {}, h("div", { class: "spacer" }), jobsUI.gallery.el),
++      h("h2", { style: "margin-top:14px" }, "Log"), jobsUI.logEl));
++  }
++  if (jobsUI.gallery && (j.status === "awaiting_review" || j.stage === "frames")) jobsUI.gallery.refresh();
++  pullLog(j);
++}
++
++function reviewControls(j) {
++  if (j.status !== "awaiting_review") return null;
++  return h("div", { class: "notice" },
++    h("strong", {}, "Review the screenshots. "), "Delete any you don't want; whatever remains is uploaded to the image host.",
++    h("div", { class: "spacer" }),
++    h("div", { class: "row" },
++      h("button", { class: "btn primary", disabled: j.regenerating, onclick: guard(async () => { await api("POST", `/api/jobs/${j.id}/proceed`, {}); await refreshJobs(); }) }, "Continue with remaining images"),
++      h("button", { class: "btn", disabled: j.regenerating, onclick: guard(async () => { await api("POST", `/api/jobs/${j.id}/regenerate`, {}); toast("Regenerating frames…"); await refreshJobs(); }) }, j.regenerating ? "Regenerating…" : "Regenerate all frames")));
++}
++
++function confirmControls(j) {
++  if (j.status !== "awaiting_confirm") return null;
++  return h("div", { class: "notice" },
++    h("strong", {}, "Ready to upload to the tracker"),
++    h("div", { class: "plan" }, j.plan.join("\n")),
++    j.error && h("div", { class: "err small" }, "Previous attempt: " + j.error),
++    h("div", { class: "row" },
++      h("button", { class: "btn primary", onclick: guard(async () => { await api("POST", `/api/jobs/${j.id}/confirm`, { go: true }); await refreshJobs(); }) }, "Upload now"),
++      h("button", { class: "btn", onclick: guard(async () => { await api("POST", `/api/jobs/${j.id}/confirm`, { go: false }); await refreshJobs(); }) }, "Cancel upload")));
++}
++
++async function pullLog(j) {
++  if (jobsUI.logJob !== j.id || j.log_count === jobsUI.logCount) return;
++  const { lines } = await api("GET", `/api/jobs/${j.id}/log?since=${jobsUI.logCount}`).catch(() => ({ lines: [] }));
++  if (!lines.length || jobsUI.logJob !== j.id) return;
++  const el = jobsUI.logEl, atEnd = el.scrollTop + el.clientHeight >= el.scrollHeight - 20;
++  el.append(lines.join("\n") + "\n");
++  jobsUI.logCount += lines.length;
++  if (atEnd) el.scrollTop = el.scrollHeight;
++}
++
++async function refreshJobs() {
++  const r = await api("GET", "/api/jobs");
++  state.jobs = r.jobs; state.maxConc = r.max_concurrent;
++  const n = r.jobs.filter(isActive).length, w = r.jobs.filter((j) => j.status.startsWith("awaiting")).length;
++  const b = $("#jobs-badge"); b.hidden = !n; b.textContent = w ? `${w} waiting` : n;
++  if (state.tab === "jobs") {
++    if (!document.activeElement || document.activeElement.type !== "number") drawJobsToolbar();
++    drawJobsList(); drawJobDetail(false);
++  }
++}
++
++/* ---------------- LIBRARY tab ---------------- */
++const lib = { root: h("div") };
++const libLoad = guard(async () => {
++  if (state.lib) return libOpen(state.lib);
++  const { outputs } = await api("GET", "/api/outputs");
++  lib.root.replaceChildren(h("div", { class: "row" }, h("h2", { class: "grow" }, "Generated screenshots"), h("button", { class: "btn", onclick: libLoad }, "Refresh")),
++    outputs.length ? h("div", { class: "grid outputs" }, outputs.map((o) => h("div", { class: "card", onclick: () => { state.lib = o.name; libLoad(); } },
++      o.cover ? h("img", { loading: "lazy", src: `/api/outputs/${enc(o.name)}/thumb/${enc(o.cover)}`, alt: "" }) : h("div", { class: "empty" }, "no images"),
++      h("div", { class: "title", title: o.name }, o.name.replace(/^UPLOAD\./, "")),
++      h("div", { class: "cap" }, h("span", {}, `${o.images} image(s)${o.job ? " · active" : ""}`), h("span", {}, fmtTime(o.mtime)))))) : h("div", { class: "empty" }, "Nothing generated yet."));
++});
++
++function libOpen(name) {
++  const g = Gallery(name);
++  lib.root.replaceChildren(h("div", { class: "row" },
++    h("button", { class: "btn", onclick: () => { state.lib = null; libLoad(); } }, "← All outputs"),
++    h("h2", { class: "grow", style: "margin:0" }, name.replace(/^UPLOAD\./, "")),
++    h("button", { class: "btn danger", onclick: guard(async () => {
++      if (!confirm(`Delete the whole folder ${name} (images, .torrent, .nfo)?`)) return;
++      await api("DELETE", `/api/outputs/${enc(name)}`); state.lib = null; libLoad();
++    }) }, "Delete folder")), g.el);
++}
++
++/* ---------------- SETTINGS tab ---------------- */
++const settingsLoad = guard(async () => {
++  const c = state.config = await api("GET", "/api/config");
++  const draft = { secrets: {} };
++  const bool = (k, label) => h("label", { class: "chk" }, h("input", { type: "checkbox", checked: !!c[k], onchange: (e) => (draft[k] = e.target.checked) }), label);
++  const secret = (k, label) => h("div", { class: "f" }, h("label", {}, label, " ", h("span", { class: "muted small" }, c.secrets[k] ? "(set – leave blank to keep)" : "(not set)")),
++    h("input", { type: "password", autocomplete: "off", placeholder: c.secrets[k] ? "••••••••" : "", oninput: (e) => (draft.secrets[k] = e.target.value) }));
++  $("#tab-settings").replaceChildren(h("div", { class: "panel form" },
++    h("h2", {}, "Settings (config.json)"),
++    secret("announce_url", "Announce URL"), secret("tmdb_api_key", "TMDB API key"), secret("tracker_api_token", "Tracker API token"), secret("upload_endpoint", "Upload endpoint"),
++    bool("confirm_before_upload", "Confirm before upload"), bool("anonymous_upload", "Anonymous upload"), bool("personal_release", "Personal release"), bool("stream_optimized", "Stream optimised"),
++    h("div", { class: "f" }, h("label", {}, "Group separator"), h("input", { type: "text", value: c.group_separator, oninput: (e) => (draft.group_separator = e.target.value) })),
++    h("div", { class: "muted small" }, "Secrets are never sent back to the browser. ‘Run as user’ from the CLI is not used by the web UI; jobs run as the user running the server."),
++    h("div", {}, h("button", { class: "btn primary", onclick: guard(async () => { await api("PUT", "/api/config", draft); toast("Saved"); files.opts = null; settingsLoad(); }) }, "Save"))));
++});
++
++/* ---------------- tabs / boot ---------------- */
++function switchTab(tab) {
++  state.tab = tab;
++  document.querySelectorAll("#tabs button").forEach((b) => b.classList.toggle("active", b.dataset.tab === tab));
++  for (const t of ["files", "jobs", "library", "settings"]) $("#tab-" + t).hidden = t !== tab;
++  if (tab === "jobs") { drawJobsToolbar(); drawJobsList(); drawJobDetail(true); refreshJobs(); }
++  if (tab === "library") libLoad();
++  if (tab === "settings") settingsLoad();
++}
++document.querySelectorAll("#tabs button").forEach((b) => b.addEventListener("click", () => switchTab(b.dataset.tab)));
++
++(async function boot() {
++  $("#tab-library").append(lib.root);
++  buildJobs();
++  await api("GET", "/api/config").then((c) => (state.config = c)).catch(() => {});
++  buildFiles();
++  api("GET", "/api/tools").then((t) => {
++    const missing = Object.entries(t).filter(([, ok]) => !ok).map(([n]) => n);
++    if (missing.length) $("#tools").textContent = "Missing on server: " + missing.join(", ");
++  }).catch(() => {});
++  refreshJobs().catch(() => {});
++  setInterval(() => refreshJobs().catch(() => {}), 1500);
++})();
+diff --git a/webui/static/index.html b/webui/static/index.html
+new file mode 100644
+index 0000000..06abfec
+--- /dev/null
++++ b/webui/static/index.html
+@@ -0,0 +1,30 @@
++<!doctype html>
++<html lang="en">
++<head>
++<meta charset="utf-8">
++<meta name="viewport" content="width=device-width, initial-scale=1">
++<title>Tracker Upload</title>
++<link rel="stylesheet" href="/static/style.css">
++</head>
++<body>
++<header>
++  <h1>Tracker Upload</h1>
++  <nav id="tabs">
++    <button data-tab="files" class="active">Files</button>
++    <button data-tab="jobs">Jobs <span id="jobs-badge" class="badge" hidden></span></button>
++    <button data-tab="library">Library</button>
++    <button data-tab="settings">Settings</button>
++  </nav>
++  <div id="tools" class="muted"></div>
++</header>
++<main>
++  <section id="tab-files"></section>
++  <section id="tab-jobs" hidden></section>
++  <section id="tab-library" hidden></section>
++  <section id="tab-settings" hidden></section>
++</main>
++<div id="lightbox" hidden></div>
++<div id="toast" hidden></div>
++<script src="/static/app.js"></script>
++</body>
++</html>
+diff --git a/webui/static/style.css b/webui/static/style.css
+new file mode 100644
+index 0000000..7a56b15
+--- /dev/null
++++ b/webui/static/style.css
+@@ -0,0 +1,99 @@
++:root {
++  --bg: #f6f7f9; --panel: #fff; --text: #1b1f27; --muted: #6a7384; --line: #e2e5ea;
++  --accent: #3b6df0; --accent-text: #fff; --ok: #1f9d55; --warn: #c27c0e; --bad: #d64545; --sel: #e8efff;
++}
++@media (prefers-color-scheme: dark) {
++  :root { --bg: #14171c; --panel: #1c2027; --text: #e6e9ef; --muted: #8b94a5; --line: #2b313b;
++          --accent: #6b93ff; --accent-text: #0b1020; --ok: #4cc38a; --warn: #e0a43a; --bad: #ff7070; --sel: #232d45; }
++}
++* { box-sizing: border-box; }
++body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.45 system-ui, sans-serif; }
++header { display: flex; align-items: center; gap: 24px; padding: 10px 20px; background: var(--panel); border-bottom: 1px solid var(--line); position: sticky; top: 0; z-index: 5; flex-wrap: wrap; }
++h1 { font-size: 16px; margin: 0; }
++h2 { font-size: 15px; margin: 0 0 10px; }
++nav { display: flex; gap: 4px; }
++nav button { background: none; border: 0; padding: 7px 12px; border-radius: 6px; color: var(--muted); cursor: pointer; font: inherit; }
++nav button.active { background: var(--sel); color: var(--accent); font-weight: 600; }
++main { padding: 16px 20px; max-width: 1400px; margin: 0 auto; }
++.muted { color: var(--muted); }
++.small { font-size: 12px; }
++.panel { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px; }
++.row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
++.grow { flex: 1; min-width: 0; }
++.spacer { height: 12px; }
++button.btn, a.btn { background: var(--panel); color: var(--text); border: 1px solid var(--line); border-radius: 6px; padding: 6px 12px; cursor: pointer; font: inherit; text-decoration: none; }
++button.btn:hover { border-color: var(--accent); }
++button.btn.primary { background: var(--accent); color: var(--accent-text); border-color: var(--accent); font-weight: 600; }
++button.btn.danger { color: var(--bad); }
++button.btn.danger.fill { background: var(--bad); color: #fff; border-color: var(--bad); }
++button.btn:disabled { opacity: .45; cursor: not-allowed; }
++input[type=text], input[type=password], input[type=number] { background: var(--bg); color: var(--text); border: 1px solid var(--line); border-radius: 6px; padding: 6px 9px; font: inherit; }
++input[type=number] { width: 64px; }
++label.chk { display: inline-flex; gap: 6px; align-items: center; cursor: pointer; }
++.badge { background: var(--accent); color: var(--accent-text); border-radius: 9px; padding: 0 6px; font-size: 11px; }
++
++/* files */
++.files-layout { display: grid; grid-template-columns: 1fr 340px; gap: 14px; align-items: start; }
++@media (max-width: 950px) { .files-layout { grid-template-columns: 1fr; } }
++.crumbs { display: flex; gap: 2px; flex-wrap: wrap; align-items: center; }
++.crumbs button { background: none; border: 0; color: var(--accent); cursor: pointer; padding: 2px 4px; font: inherit; border-radius: 4px; }
++.crumbs button:hover { background: var(--sel); }
++table.fs { width: 100%; border-collapse: collapse; }
++table.fs td, table.fs th { padding: 5px 8px; border-bottom: 1px solid var(--line); text-align: left; white-space: nowrap; }
++table.fs th { font-weight: 500; color: var(--muted); font-size: 12px; }
++table.fs tr.sel { background: var(--sel); }
++table.fs tr:hover { background: var(--sel); }
++table.fs td.name { width: 100%; max-width: 0; overflow: hidden; text-overflow: ellipsis; }
++table.fs td.num { text-align: right; color: var(--muted); }
++.fs-scroll { max-height: calc(100vh - 260px); overflow: auto; margin-top: 8px; }
++.link { background: none; border: 0; padding: 0; color: inherit; cursor: pointer; font: inherit; text-align: left; }
++.link.dir { color: var(--accent); font-weight: 500; }
++.tag { font-size: 11px; padding: 1px 6px; border-radius: 4px; background: var(--sel); color: var(--accent); margin-left: 6px; }
++.tray ul { list-style: none; margin: 0 0 10px; padding: 0; max-height: 220px; overflow: auto; }
++.tray li { display: flex; gap: 6px; align-items: center; padding: 3px 0; border-bottom: 1px solid var(--line); }
++.tray li span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; direction: rtl; text-align: left; }
++.tray .opts { display: grid; gap: 6px; margin: 10px 0; }
++.insp { font-size: 12px; background: var(--bg); border-radius: 6px; padding: 6px 8px; margin: 4px 0; }
++
++/* jobs */
++.jobs-layout { display: grid; grid-template-columns: 420px 1fr; gap: 14px; align-items: start; }
++@media (max-width: 1000px) { .jobs-layout { grid-template-columns: 1fr; } }
++.job { border: 1px solid var(--line); border-radius: 8px; padding: 10px; margin-bottom: 8px; background: var(--panel); cursor: pointer; }
++.job.open { border-color: var(--accent); }
++.job .title { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
++.pill { font-size: 11px; padding: 1px 8px; border-radius: 10px; border: 1px solid var(--line); white-space: nowrap; }
++.pill.running { color: var(--accent); border-color: var(--accent); }
++.pill.awaiting_review, .pill.awaiting_confirm { color: var(--warn); border-color: var(--warn); }
++.pill.finished { color: var(--ok); border-color: var(--ok); }
++.pill.failed, .pill.interrupted { color: var(--bad); border-color: var(--bad); }
++.bar { height: 6px; background: var(--line); border-radius: 3px; overflow: hidden; margin: 8px 0 4px; }
++.bar > div { height: 100%; background: var(--accent); transition: width .4s; }
++.job.done .bar > div, .job.finished .bar > div { background: var(--ok); }
++.steps { display: flex; gap: 4px; margin: 10px 0; flex-wrap: wrap; }
++.steps span { font-size: 12px; padding: 2px 9px; border-radius: 10px; background: var(--bg); color: var(--muted); }
++.steps span.now { background: var(--accent); color: var(--accent-text); }
++.steps span.past { color: var(--ok); }
++pre.log { background: #0f1217; color: #cfd6e4; padding: 10px; border-radius: 8px; max-height: 300px; overflow: auto; font: 12px/1.4 ui-monospace, monospace; margin: 8px 0 0; white-space: pre-wrap; word-break: break-word; }
++.plan { background: var(--bg); border-radius: 8px; padding: 8px 10px; font: 12px/1.5 ui-monospace, monospace; white-space: pre-wrap; margin: 8px 0; }
++.notice { border-left: 3px solid var(--warn); background: var(--bg); padding: 8px 10px; border-radius: 4px; margin: 8px 0; }
++.err { color: var(--bad); }
++
++/* gallery */
++.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: 10px; margin-top: 10px; }
++.card { position: relative; border: 2px solid transparent; border-radius: 8px; overflow: hidden; background: var(--panel); outline: 1px solid var(--line); }
++.card.sel { border-color: var(--bad); }
++.card img { width: 100%; display: block; aspect-ratio: 16/9; object-fit: cover; cursor: zoom-in; background: #000; }
++.card .cap { padding: 4px 8px; font-size: 11px; color: var(--muted); display: flex; justify-content: space-between; gap: 6px; }
++.card input[type=checkbox] { position: absolute; top: 8px; left: 8px; width: 18px; height: 18px; cursor: pointer; }
++.outputs .card img { aspect-ratio: 16/9; }
++.outputs .card { cursor: pointer; }
++.card .title { padding: 6px 8px 0; font-weight: 600; font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
++.empty { text-align: center; padding: 30px; color: var(--muted); }
++
++#lightbox { position: fixed; inset: 0; background: rgba(0,0,0,.88); z-index: 20; display: flex; flex-direction: column; align-items: center; justify-content: center; }
++#lightbox[hidden], #toast[hidden] { display: none; }
++#lightbox img { max-width: 94vw; max-height: 82vh; object-fit: contain; }
++#lightbox .bar2 { color: #fff; margin-top: 10px; display: flex; gap: 8px; align-items: center; }
++#toast { position: fixed; bottom: 18px; left: 50%; transform: translateX(-50%); background: var(--text); color: var(--bg); padding: 8px 16px; border-radius: 8px; z-index: 30; max-width: 90vw; }
++.form { display: grid; gap: 12px; max-width: 560px; }
++.form .f { display: grid; gap: 4px; }
+-- 
+2.43.0
+
+
+From 218123a2424395ccef364b9c14993c2e6880333a Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 29 Oct 2026 21:50:11 -0400
+Subject: [PATCH 2/2] Multiple trackers, download clients, description
+ templates with variables
+
+- config: trackers map (odf default) + download_clients; flat config migrates
+- clients: qBittorrent, Transmission, Deluge; adds the tracker's own .torrent after upload
+- variables: registry for description templates (TMDB, file, torrent, images)
+- web UI: tracker/client pickers, settings editor, re-add to client
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01QbS6VRfvKUqpr95pyvKWfN
+---
+ README.md              |  17 ++++
+ config_example.json    |  28 +++++-
+ src/cli.py             |  19 +++-
+ src/clients.py         | 224 +++++++++++++++++++++++++++++++++++++++++
+ src/config.py          |  97 +++++++++++++++---
+ src/models.py          |   7 ++
+ src/tmdb.py            |  10 ++
+ src/tracker.py         |  83 ++++++++-------
+ src/variables.py       | 159 +++++++++++++++++++++++++++++
+ webui/app.py           | 111 ++++++++++++++++----
+ webui/jobs.py          |  69 ++++++++++---
+ webui/static/app.js    | 155 +++++++++++++++++++++++++---
+ webui/static/style.css |  11 ++
+ 13 files changed, 888 insertions(+), 102 deletions(-)
+ create mode 100644 src/clients.py
+ create mode 100644 src/variables.py
+
+diff --git a/README.md b/README.md
+index 3fec40e..e1fdc3d 100644
+--- a/README.md
++++ b/README.md
+@@ -16,3 +16,20 @@ Open the URL it prints (it contains a one-time access token). The UI lets you:
+ 
+ Per-run options (review pause, auto-upload, anonymous/personal/stream) are set when queueing and override `config.json` for that job only.
+ The server binds to localhost by default; use `--root` to limit what the browser may see. `run_as_user` is ignored by the web UI.
++
++## Trackers, download clients, description variables
++
++`config.json` now has a `trackers` map (default `odf`, change with `default_tracker`) and a `download_clients` map
++(`qbittorrent`, `transmission`, `deluge`). Old flat configs (`announce_url`, `tracker_api_token`, `upload_endpoint`) are
++migrated to the `odf` tracker automatically. See `config_example.json`.
++
++CLI: `./run.sh [--tracker NAME] [--client NAME|none] <file or folder>`. Runs for a non-default tracker write to
++`output/UPLOAD.<name>.<tracker>` so they don't collide with the default one.
++
++After a successful upload, the tracker's own `.torrent` (the link in the API response) is downloaded and added to the
++tracker's `download_client`, pointing at the folder that already holds the content. Use `local_path`/`remote_path` when the
++client sees a different path (docker). A client failure never fails the upload; the web UI can re-send it later.
++
++Each tracker has a `description` template (default `{overview}\n\n{images}`, i.e. the previous behaviour). Variables
++(`{tmdb_title}`, `{file_size}`, `{torrent_infohash}`, `{tmdb.<any TMDB field>}`, ...) are registered in `src/variables.py`;
++add one with a decorated function and it is available everywhere, including the web UI's variable list.
+diff --git a/config_example.json b/config_example.json
+index b5ffd6e..ce947dc 100644
+--- a/config_example.json
++++ b/config_example.json
+@@ -1,8 +1,30 @@
+ {
+-  "announce_url": "#",
+   "tmdb_api_key": "#",
+-  "tracker_api_token": "#",
+-  "upload_endpoint": "#",
++  "default_tracker": "odf",
++  "trackers": {
++    "odf": {
++      "announce_url": "#",
++      "api_token": "#",
++      "upload_endpoint": "#",
++      "description": "{overview}\n\n{images}",
++      "download_client": "qbit"
++    }
++  },
++  "download_clients": {
++    "qbit": {
++      "type": "qbittorrent",
++      "url": "http://localhost:8080",
++      "username": "",
++      "password": "",
++      "save_path": "",
++      "local_path": "",
++      "remote_path": "",
++      "category": "",
++      "tags": "",
++      "paused": false,
++      "skip_checking": false
++    }
++  },
+   "confirm_before_upload": true,
+   "anonymous_upload": false,
+   "personal_release": false,
+diff --git a/src/cli.py b/src/cli.py
+index 0d6d1aa..b12f425 100644
+--- a/src/cli.py
++++ b/src/cli.py
+@@ -1,4 +1,5 @@
+ from __future__ import annotations
++import argparse
+ import os
+ import shutil
+ import subprocess
+@@ -7,6 +8,7 @@ import re
+ import threading
+ from pathlib import Path
+ 
++from .config import ConfigError, get_tracker, output_dir_name
+ from .core import find_videos, episode_videos, episode_info, extract_frames, pause
+ from .models import Job
+ from .tmdb import lookup_tmdb
+@@ -18,11 +20,19 @@ def read_mediainfo(video: Path) -> str:
+     return re.sub(r"^(Complete name\s*:\s*).*$", lambda m: m.group(1) + video.name, text, flags=__import__("re").M)
+ 
+ def main() -> int:
+-    if len(sys.argv) < 2:
+-        print(f"Usage: {sys.argv[0]} <file or folder>")
++    ap = argparse.ArgumentParser(prog="run.sh", description="Screenshot, upload and (optionally) seed a release.")
++    ap.add_argument("target", help="file or folder to upload")
++    ap.add_argument("--tracker", help="tracker profile from config.json (default: the configured default, odf)")
++    ap.add_argument("--client", help='download client name, or "none" to skip (default: the tracker\'s client)')
++    args = ap.parse_args()
++    try:
++        tracker = get_tracker(args.tracker)
++    except ConfigError as e:
++        print(f"Error: {e}")
+         return 1
++    print(f"Tracker: {tracker.name}")
+ 
+-    target = Path(os.path.abspath(sys.argv[1]))
++    target = Path(os.path.abspath(args.target))
+     videos = find_videos(target)
+     if not videos:
+         print(f"Error: No .mkv/.mp4 files found in: {target}")
+@@ -40,13 +50,14 @@ def main() -> int:
+     name = release if multi else first.stem
+     ROOT_OUTPUT_DIR = Path("output")
+     ROOT_OUTPUT_DIR.mkdir(exist_ok=True)
+-    out_dir = ROOT_OUTPUT_DIR / f"UPLOAD.{name}"
++    out_dir = ROOT_OUTPUT_DIR / output_dir_name(name, tracker.name)
+     out_dir.mkdir(mode=0o755, parents=True, exist_ok=True)
+     job = Job(
+         target=target, sources=sources, first=first, release=release, name=name,
+         out_dir=out_dir, torrent_path=out_dir / f"{name}.torrent",
+         nfo_path=out_dir / f"{name}.nfo",
+         tv_hint=any(episode_info(v) for v in videos),
++        tracker=tracker, client=args.client,
+     )
+ 
+     # Start .torrent creation asynchronously in the background
+diff --git a/src/clients.py b/src/clients.py
+new file mode 100644
+index 0000000..88de84e
+--- /dev/null
++++ b/src/clients.py
+@@ -0,0 +1,224 @@
++"""Download clients (qBittorrent, Transmission, Deluge).
++
++After a successful upload the tracker returns a direct link to *its* .torrent file (not
++the one torf generated). We download that and hand the file to the client, pointing the
++client at the folder that already holds the content so it just verifies and seeds.
++
++To support another client, subclass Client and register it with @client_type.
++"""
++from __future__ import annotations
++import base64
++from pathlib import Path
++from urllib.parse import urlparse
++
++import requests
++
++from .config import CLIENT_DEFAULTS, ConfigError, Tracker, load_raw
++
++class ClientError(Exception):
++    pass
++
++CLIENT_TYPES: dict[str, type["Client"]] = {}
++
++def client_type(key: str, label: str):
++    def register(cls):
++        cls.key, cls.label = key, label
++        CLIENT_TYPES[key] = cls
++        return cls
++    return register
++
++class Client:
++    key = ""
++    label = ""
++    TIMEOUT = 30
++
++    def __init__(self, cfg: dict):
++        self.cfg = {**CLIENT_DEFAULTS, **cfg}
++        self.http = requests.Session()
++        self.base = self.cfg["url"].rstrip("/")
++
++    @property
++    def tags(self) -> list[str]:
++        return [t.strip() for t in str(self.cfg["tags"]).split(",") if t.strip()]
++
++    def save_path_for(self, content_parent: Path) -> str:
++        """Where the client should look for the data, translated for the client's filesystem."""
++        path = self.cfg["save_path"].strip() or str(content_parent)
++        local, remote = self.cfg["local_path"].strip(), self.cfg["remote_path"].strip()
++        if local and remote and path.startswith(local):
++            path = remote + path[len(local):]
++        return path
++
++    def add(self, data: bytes, filename: str, save_path: str) -> str:
++        raise NotImplementedError
++
++    def test(self) -> str:
++        raise NotImplementedError
++
++    def _post(self, url: str, **kw) -> requests.Response:
++        try:
++            return self.http.post(url, timeout=self.TIMEOUT, **kw)
++        except requests.RequestException as e:
++            raise ClientError(f"{self.label}: cannot reach {self.base} ({type(e).__name__})") from e
++
++@client_type("qbittorrent", "qBittorrent")
++class QBittorrent(Client):
++    def _login(self) -> None:
++        if not (self.cfg["username"] or self.cfg["password"]):
++            return  # auth bypass for localhost / whitelisted subnets
++        r = self._post(f"{self.base}/api/v2/auth/login", data={"username": self.cfg["username"], "password": self.cfg["password"]},
++                       headers={"Referer": self.base})
++        if r.text.strip() != "Ok.":
++            raise ClientError("qBittorrent: login failed (check username/password)")
++
++    def test(self) -> str:
++        self._login()
++        try:
++            r = self.http.get(f"{self.base}/api/v2/app/version", timeout=self.TIMEOUT, headers={"Referer": self.base})
++        except requests.RequestException as e:
++            raise ClientError(f"qBittorrent: cannot reach {self.base}") from e
++        if r.status_code != 200:
++            raise ClientError(f"qBittorrent: HTTP {r.status_code} (not logged in?)")
++        return f"qBittorrent {r.text.strip()}"
++
++    def add(self, data: bytes, filename: str, save_path: str) -> str:
++        self._login()
++        flag = lambda b: "true" if b else "false"  # noqa: E731
++        form = {"savepath": save_path, "autoTMM": "false", "paused": flag(self.cfg["paused"]),
++                "stopped": flag(self.cfg["paused"]),  # qBittorrent 5 renamed "paused" to "stopped"
++                "skip_checking": flag(self.cfg["skip_checking"])}
++        if self.cfg["category"]:
++            form["category"] = self.cfg["category"]
++        if self.tags:
++            form["tags"] = ",".join(self.tags)
++        r = self._post(f"{self.base}/api/v2/torrents/add", data=form, headers={"Referer": self.base},
++                       files={"torrents": (filename, data, "application/x-bittorrent")})
++        if r.status_code != 200 or r.text.strip() == "Fails.":
++            raise ClientError(f"qBittorrent rejected the torrent (HTTP {r.status_code}: {r.text.strip()[:100]})")
++        return f"added to qBittorrent (save path {save_path})"
++
++@client_type("transmission", "Transmission")
++class Transmission(Client):
++    def __init__(self, cfg: dict):
++        super().__init__(cfg)
++        self.rpc = self.base if self.base.endswith("/rpc") else self.base + "/transmission/rpc"
++        self.session_id = ""
++
++    def _call(self, method: str, arguments: dict) -> dict:
++        for _ in range(2):
++            headers = {"X-Transmission-Session-Id": self.session_id}
++            auth = (self.cfg["username"], self.cfg["password"]) if self.cfg["username"] else None
++            r = self._post(self.rpc, json={"method": method, "arguments": arguments}, headers=headers, auth=auth)
++            if r.status_code == 409:  # Transmission hands out a session id on the first request
++                self.session_id = r.headers.get("X-Transmission-Session-Id", "")
++                continue
++            if r.status_code == 401:
++                raise ClientError("Transmission: login failed (check username/password)")
++            if r.status_code != 200:
++                raise ClientError(f"Transmission: HTTP {r.status_code}")
++            body = r.json()
++            if body.get("result") != "success":
++                raise ClientError(f"Transmission: {body.get('result')}")
++            return body.get("arguments", {})
++        raise ClientError("Transmission: could not get a session id")
++
++    def test(self) -> str:
++        return f"Transmission {self._call('session-get', {}).get('version', '')}".strip()
++
++    def add(self, data: bytes, filename: str, save_path: str) -> str:
++        args = {"metainfo": base64.b64encode(data).decode(), "paused": bool(self.cfg["paused"]), "download-dir": save_path}
++        labels = ([self.cfg["category"]] if self.cfg["category"] else []) + self.tags
++        if labels:
++            args["labels"] = labels
++        res = self._call("torrent-add", args)
++        if "torrent-duplicate" in res:
++            return "already in Transmission"
++        return f"added to Transmission (save path {save_path})"
++
++@client_type("deluge", "Deluge (Web UI)")
++class Deluge(Client):
++    def __init__(self, cfg: dict):
++        super().__init__(cfg)
++        self.endpoint = self.base if self.base.endswith("/json") else self.base + "/json"
++        self._id = 0
++
++    def _call(self, method: str, params: list):
++        self._id += 1
++        r = self._post(self.endpoint, json={"method": method, "params": params, "id": self._id})
++        if r.status_code != 200:
++            raise ClientError(f"Deluge: HTTP {r.status_code}")
++        body = r.json()
++        if body.get("error"):
++            raise ClientError(f"Deluge: {body['error'].get('message', body['error'])}")
++        return body.get("result")
++
++    def _login(self) -> None:
++        if not self._call("auth.login", [self.cfg["password"]]):
++            raise ClientError("Deluge: login failed (check the Web UI password)")
++        if not self._call("web.connected", []):
++            hosts = self._call("web.get_hosts", [])
++            if not hosts:
++                raise ClientError("Deluge: Web UI is not connected to a daemon")
++            self._call("web.connect", [hosts[0][0]])
++
++    def test(self) -> str:
++        self._login()
++        return f"Deluge {self._call('daemon.get_version', [])}"
++
++    def add(self, data: bytes, filename: str, save_path: str) -> str:
++        self._login()
++        opts = {"download_location": save_path, "add_paused": bool(self.cfg["paused"])}
++        tid = self._call("core.add_torrent_file", [filename, base64.b64encode(data).decode(), opts])
++        if not tid:
++            return "already in Deluge"
++        if self.cfg["category"]:  # needs the Label plugin; ignore failures
++            try:
++                self._call("label.set_torrent", [tid, self.cfg["category"]])
++            except ClientError:
++                pass
++        return f"added to Deluge (save path {save_path})"
++
++def make_client(name: str, cfg: dict | None = None) -> Client:
++    cfg = cfg or load_raw()
++    if name not in cfg["download_clients"]:
++        raise ClientError(f'Download client "{name}" is not configured')
++    entry = cfg["download_clients"][name]
++    if entry["type"] not in CLIENT_TYPES:
++        raise ClientError(f'Unknown client type "{entry["type"]}"')
++    return CLIENT_TYPES[entry["type"]](entry)
++
++def fetch_tracker_torrent(tracker: Tracker, url: str) -> bytes:
++    """Download the tracker's own .torrent. The API token is only sent to the tracker's host."""
++    headers = {}
++    if urlparse(url).netloc == urlparse(tracker.upload_endpoint).netloc:
++        headers["Authorization"] = f"Bearer {tracker.api_token.strip()}"
++    try:
++        r = requests.get(url, headers=headers, timeout=60)
++    except requests.RequestException as e:
++        raise ClientError(f"could not download the tracker's .torrent ({type(e).__name__})") from e
++    if r.status_code != 200:
++        raise ClientError(f"tracker .torrent download failed (HTTP {r.status_code})")
++    if not r.content.startswith(b"d"):  # bencoded dictionary
++        raise ClientError("the tracker link did not return a .torrent file")
++    return r.content
++
++def resolve_client_name(tracker: Tracker, override: str | None) -> str | None:
++    """override: None = tracker default, "none" = no client, anything else = that client."""
++    if override == "none":
++        return None
++    return (override or tracker.download_client or "").strip() or None
++
++def add_release_to_client(client_name: str, tracker: Tracker, torrent_url: str, target: Path,
++                          torrent_name: str, copy_to: Path | None = None) -> str:
++    """Download the tracker's .torrent and add it to the client. Returns a status message."""
++    try:
++        client = make_client(client_name)
++    except ConfigError as e:
++        raise ClientError(str(e)) from e
++    data = fetch_tracker_torrent(tracker, torrent_url)
++    if copy_to:
++        try:
++            copy_to.write_bytes(data)
++        except OSError:
++            pass
++    return client.add(data, f"{torrent_name}.torrent", client.save_path_for(target.parent))
+diff --git a/src/config.py b/src/config.py
+index e52d18f..65d8db9 100644
+--- a/src/config.py
++++ b/src/config.py
+@@ -1,23 +1,53 @@
+ from __future__ import annotations
++import copy
+ import json
+ import os
++from dataclasses import dataclass
+ from pathlib import Path
+ 
+ # AAODF_CONFIG lets the web UI run a job with per-job overrides
+ CONFIG_FILE = Path(os.environ.get("AAODF_CONFIG") or "config.json")
+ 
+-DEFAULT_CONFIG = {
++DEFAULT_TRACKER_NAME = "odf"
++# Same text the uploader always produced: TMDB overview, blank line, image links.
++DEFAULT_DESCRIPTION = "{overview}\n\n{images}"
++
++TRACKER_DEFAULTS = {
+     "announce_url": "#",
+-    "tmdb_api_key": "#",
+-    "tracker_api_token": "#",
++    "api_token": "#",
+     "upload_endpoint": "#",
++    "description": DEFAULT_DESCRIPTION,
++    "download_client": "",   # name from "download_clients", "" = don't add anywhere
++}
++TRACKER_SECRETS = ("announce_url", "api_token", "upload_endpoint")
++
++CLIENT_DEFAULTS = {
++    "type": "qbittorrent",    # qbittorrent | transmission | deluge
++    "url": "http://localhost:8080",
++    "username": "",
++    "password": "",
++    "save_path": "",          # "" = folder that contains the uploaded content
++    "local_path": "",         # optional path translation for clients in docker/remote hosts:
++    "remote_path": "",        # a save path starting with local_path is rewritten to remote_path
++    "category": "",
++    "tags": "",               # comma separated
++    "paused": False,
++    "skip_checking": False,   # qBittorrent only
++}
++
++DEFAULT_CONFIG = {
++    "tmdb_api_key": "#",
++    "default_tracker": DEFAULT_TRACKER_NAME,
++    "trackers": {DEFAULT_TRACKER_NAME: dict(TRACKER_DEFAULTS)},
++    "download_clients": {},
+     "confirm_before_upload": True,
+     "anonymous_upload": False,
+     "personal_release": False,
+     "stream_optimized": False,
+     "group_separator": "-",
+-    "run_as_user": ""
++    "run_as_user": "",
+ }
++_LEGACY_TRACKER_KEYS = {"announce_url": "announce_url", "tracker_api_token": "api_token", "upload_endpoint": "upload_endpoint"}
+ 
+ TYPE_IDS = {
+     "disc": 1,
+@@ -33,23 +63,62 @@ RESOLUTION_IDS = {
+     "576p": 6, "576i": 7, "480p": 8, "480i": 9, "Other": 10,
+ }
+ 
+-def load_config() -> dict:
++class ConfigError(Exception):
++    pass
++
++@dataclass(frozen=True)
++class Tracker:
++    name: str
++    announce_url: str
++    api_token: str
++    upload_endpoint: str
++    description: str
++    download_client: str
++
++def is_set(value: object) -> bool:
++    return str(value or "").strip() not in ("", "#")
++
++def normalize(data: dict) -> dict:
++    """Return a full v2 config from any stored config (old flat tracker keys are migrated)."""
++    cfg = copy.deepcopy(DEFAULT_CONFIG)
++    for key, value in data.items():
++        if key not in ("trackers", "download_clients") and key not in _LEGACY_TRACKER_KEYS:
++            cfg[key] = value
++    trackers = data.get("trackers")
++    if not isinstance(trackers, dict) or not trackers:
++        legacy = {new: data[old] for old, new in _LEGACY_TRACKER_KEYS.items() if old in data}
++        trackers = {DEFAULT_TRACKER_NAME: legacy}
++    cfg["trackers"] = {str(n): {**TRACKER_DEFAULTS, **t} for n, t in trackers.items() if isinstance(t, dict)}
++    clients = data.get("download_clients")
++    cfg["download_clients"] = {str(n): {**CLIENT_DEFAULTS, **c} for n, c in (clients or {}).items() if isinstance(c, dict)}
++    if cfg["default_tracker"] not in cfg["trackers"]:
++        cfg["default_tracker"] = DEFAULT_TRACKER_NAME if DEFAULT_TRACKER_NAME in cfg["trackers"] else next(iter(cfg["trackers"]))
++    return cfg
++
++def load_raw() -> dict:
++    """Read the config file fresh (creating it with defaults if missing)."""
+     if not CONFIG_FILE.exists():
+         CONFIG_FILE.write_text(json.dumps(DEFAULT_CONFIG, indent=4), encoding="utf-8")
+     try:
+-        data = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+-        config = DEFAULT_CONFIG.copy()
+-        config.update(data)
+-        return config
++        return normalize(json.loads(CONFIG_FILE.read_text(encoding="utf-8")))
+     except Exception:
+-        return DEFAULT_CONFIG.copy()
++        return normalize({})
++
++def get_tracker(name: str | None = None, cfg: dict | None = None) -> Tracker:
++    cfg = cfg or load_raw()
++    name = name or cfg["default_tracker"]
++    if name not in cfg["trackers"]:
++        raise ConfigError(f'Unknown tracker "{name}". Configured: {", ".join(cfg["trackers"])}')
++    return Tracker(name=name, **{k: cfg["trackers"][name][k] for k in TRACKER_DEFAULTS})
++
++def output_dir_name(release_name: str, tracker_name: str) -> str:
++    """The default tracker keeps the historical folder name; others get a suffix so runs don't collide."""
++    base = f"UPLOAD.{release_name}"
++    return base if tracker_name == DEFAULT_TRACKER_NAME else f"{base}.{tracker_name}"
+ 
+-config = load_config()
++config = load_raw()
+ 
+-ANNOUNCE_URL = config.get("announce_url", "#")
+ TMDB_API_KEY = config.get("tmdb_api_key", "#")
+-TRACKER_API_TOKEN = config.get("tracker_api_token", "#")
+-UPLOAD_ENDPOINT = config.get("upload_endpoint", "#")
+ CONFIRM_BEFORE_UPLOAD = config.get("confirm_before_upload", True)
+ ANONYMOUS_UPLOAD = config.get("anonymous_upload", False)
+ PERSONAL_RELEASE = config.get("personal_release", False)
+diff --git a/src/models.py b/src/models.py
+index f6c0ff9..a019e17 100644
+--- a/src/models.py
++++ b/src/models.py
+@@ -1,6 +1,7 @@
+ from __future__ import annotations
+ from dataclasses import dataclass, field
+ from pathlib import Path
++from .config import Tracker
+ 
+ @dataclass
+ class TmdbInfo:
+@@ -11,6 +12,7 @@ class TmdbInfo:
+     overview: str
+     imdb_id: int = 0
+     tvdb_id: int = 0
++    raw: dict = field(default_factory=dict)  # everything TMDB returned; see {tmdb.<field>} variables
+ 
+     @property
+     def label(self) -> str:
+@@ -32,6 +34,11 @@ class Job:
+     links: list[str] = field(default_factory=list)
+     description: str = ""
+     tags: dict | None = None
++    tracker: Tracker | None = None
++    client: str | None = None      # None = tracker's default, "none" = don't add to a client
++    mediainfo: str = ""
++    upload_name: str = ""
++    cache: dict = field(default_factory=dict)
+ 
+ @dataclass
+ class Plan:
+diff --git a/src/tmdb.py b/src/tmdb.py
+index 4540d65..26a2462 100644
+--- a/src/tmdb.py
++++ b/src/tmdb.py
+@@ -59,6 +59,7 @@ def tmdb_find(title: str, year: int | None, is_tv: bool) -> TmdbInfo | None:
+             title=top.get("name") or top.get("title") or title,
+             year=int(date) if date.isdigit() else None,
+             overview=(top.get("overview") or "").strip(),
++            raw=dict(top),
+         )
+     return None
+ 
+@@ -68,6 +69,10 @@ def tmdb_external_ids(info: TmdbInfo) -> None:
+     info.imdb_id = int(imdb[2:]) if imdb[:2] == "tt" and imdb[2:].isdigit() else 0
+     info.tvdb_id = int(data.get("tvdb_id") or 0)
+ 
++def tmdb_details(info: TmdbInfo) -> None:
++    """Merge the full details (genres, runtime, tagline...) into info.raw for use as {tmdb.*} variables."""
++    info.raw.update(tmdb_get(f"/{info.kind}/{info.id}", {}))
++
+ def lookup_tmdb(release: str, tv_hint: bool = False) -> TmdbInfo | None:
+     if not TMDB_API_KEY.strip():
+         print("TMDB_API_KEY is empty - skipping description lookup.")
+@@ -89,6 +94,10 @@ def lookup_tmdb(release: str, tv_hint: bool = False) -> TmdbInfo | None:
+         tmdb_external_ids(info)
+     except (requests.RequestException, ValueError) as e:
+         print(f"Could not fetch IMDb/TVDB ids: {short_msg(e)}")
++    try:
++        tmdb_details(info)
++    except (requests.RequestException, ValueError) as e:
++        print(f"Could not fetch extra TMDB details: {short_msg(e)}")
+     if not info.overview:
+         print("TMDB has no description for this title.")
+     return info
+@@ -101,6 +110,7 @@ def tmdb_by_id(kind: str, tmdb_id: int) -> TmdbInfo:
+         title=data.get("name") or data.get("title") or "",
+         year=int(date) if date.isdigit() else None,
+         overview=(data.get("overview") or "").strip(),
++        raw=dict(data),
+     )
+     try:
+         tmdb_external_ids(info)
+diff --git a/src/tracker.py b/src/tracker.py
+index 33b00f3..ca7f4c6 100644
+--- a/src/tracker.py
++++ b/src/tracker.py
+@@ -12,10 +12,11 @@ import requests
+ from torf import Torrent
+ 
+ from .config import (
+-    ANNOUNCE_URL, TRACKER_API_TOKEN, UPLOAD_ENDPOINT,
+     CONFIRM_BEFORE_UPLOAD, ANONYMOUS_UPLOAD, PERSONAL_RELEASE,
+-    STREAM_OPTIMIZED, TYPE_IDS, RESOLUTION_IDS
++    STREAM_OPTIMIZED, TYPE_IDS, RESOLUTION_IDS, DEFAULT_DESCRIPTION, Tracker, is_set
+ )
++from .clients import ClientError, add_release_to_client, resolve_client_name
++from .variables import render
+ from .models import Job, Plan
+ from .parsers import parse_tags, mediainfo_tags, tv_numbers, build_name, pick_type
+ from .tmdb import tmdb_by_id
+@@ -34,26 +35,13 @@ _FORBIDDEN_RE = re.compile(r'[<>:"/\\|?*]')
+ def clean_title(name: str) -> str:
+     return re.sub(r"\s+", " ", _FORBIDDEN_RE.sub("", name)).strip()[:255]
+ 
+-def compose_description(overview: str, links: list[str]) -> str:
+-    return "\n\n".join(p for p in (overview, "\n".join(links)) if p)
+-
+ def update_description(job: Job, *, overview: str | None = None, links: list[str] | None = None) -> None:
+-    new_overview = job.overview if overview is None else overview
+-    new_links = job.links if links is None else links
+-    old_default = compose_description(job.overview, job.links)
+-    desc = job.description
+-    if desc in ("", old_default):
+-        desc = compose_description(new_overview, new_links)
+-    else:
+-        for label, old, new in (
+-            ("image links", "\n".join(job.links), "\n".join(new_links)),
+-            ("TMDB description", job.overview, new_overview),
+-        ):
+-            if old == new:
+-                continue
+-            if old and old in desc:
+-                desc = desc.replace(old, new, 1)
+-    job.description, job.overview, job.links = desc, new_overview, new_links
++    """Remember the TMDB overview / image links. The text itself is rendered from the
++    tracker's description template when the upload is planned (see variables.py)."""
++    if overview is not None:
++        job.overview = overview
++    if links is not None:
++        job.links = links
+ 
+ def get_category_id(is_tv: bool, multi: bool, tags: dict) -> int:
+     resolution = tags.get("resolution") or ""
+@@ -106,8 +94,8 @@ def get_category_id(is_tv: bool, multi: bool, tags: dict) -> int:
+ 
+ def compute_plan(job: Job, mediainfo_text: str) -> Plan | None:
+     from .tmdb import parse_release
+-    if not TRACKER_API_TOKEN.strip():
+-        print("TRACKER_API_TOKEN is empty - skipping tracker upload.")
++    if not is_set(job.tracker.api_token):
++        print(f'API token for tracker "{job.tracker.name}" is not set - skipping tracker upload.')
+         return None
+     info = job.info
+     if info is None or not info.id:
+@@ -135,6 +123,8 @@ def compute_plan(job: Job, mediainfo_text: str) -> Plan | None:
+     resolution = tags["resolution"] or "Other"
+     type_key, type_known = pick_type(tags)
+     multi = len(job.sources) > 1
++    job.upload_name, job.mediainfo = name, mediainfo_text
++    job.description = render(job.tracker.description or DEFAULT_DESCRIPTION, job)
+     fields = {
+         "name": name,
+         "description": job.description or name,
+@@ -170,7 +160,7 @@ def _label_for(mapping: dict, value: int, labels: dict | None = None) -> str:
+     key = next((k for k, v in mapping.items() if v == value), None)
+     return (labels or {}).get(key, key) if key else "?"
+ 
+-def print_plan(plan: Plan) -> None:
++def print_plan(plan: Plan, tracker_name: str = "") -> None:
+     f = plan.fields
+     note = ""
+     if not plan.type_known and "type_id" not in plan.edited:
+@@ -178,6 +168,7 @@ def print_plan(plan: Plan) -> None:
+     desc = f["description"]
+     print()
+     print("Upload details:")
++    print(f"  Tracker:      {tracker_name}")
+     print(f"  Name:         {f['name']}")
+     print(f"  Category:     {'TV' if plan.is_tv else 'Movie'} (id {f['category_id']})")
+     print(f"  Type:         {_label_for(TYPE_IDS, f['type_id'], TYPE_LABELS)} (id {f['type_id']}){note}")
+@@ -185,19 +176,20 @@ def print_plan(plan: Plan) -> None:
+     print(f"  TMDB match:   {plan.info.label}")
+     print(f"  Description:  {len(desc)} characters, {desc.count('[img]')} image link(s)")
+ 
+-def post_upload(fields: dict, torrent_path: Path, nfo_path: Path) -> bool:
+-    headers = {"Authorization": f"Bearer {TRACKER_API_TOKEN.strip()}", "Accept": "application/json"}
++def post_upload(tracker: Tracker, fields: dict, torrent_path: Path, nfo_path: Path) -> tuple[bool, str | None]:
++    """Returns (success, url of the tracker's .torrent file if the response gave one)."""
++    headers = {"Authorization": f"Bearer {tracker.api_token.strip()}", "Accept": "application/json"}
+     try:
+         with torrent_path.open("rb") as tf, nfo_path.open("rb") as nf:
+             r = requests.post(
+-                UPLOAD_ENDPOINT, headers=headers, data=fields,
++                tracker.upload_endpoint, headers=headers, data=fields,
+                 files={"torrent": (torrent_path.name, tf, "application/x-bittorrent"),
+                        "nfo": (nfo_path.name, nf, "text/plain")},
+                 timeout=300,
+             )
+     except (requests.RequestException, OSError) as e:
+         print(f"Upload failed: {short_msg(e) or type(e).__name__}")
+-        return False
++        return False, None
+     
+     raw_text = r.text.strip()
+     body = None
+@@ -215,6 +207,7 @@ def post_upload(fields: dict, torrent_path: Path, nfo_path: Path) -> bool:
+ 
+     if success:
+         print("Upload successful.")
++        url = None
+         if isinstance(body, dict):
+             data = body.get("data")
+             data_dict = data if isinstance(data, dict) else {}
+@@ -233,12 +226,13 @@ def post_upload(fields: dict, torrent_path: Path, nfo_path: Path) -> bool:
+             else:
+                 print(f"Response data: {body}")
+         elif isinstance(body, str) and body:
++            url = body if body.startswith(("http://", "https://")) else None
+             print(f"Link: {body}")
+-        return True
++        return True, url
+ 
+     print(f"Upload failed (HTTP {r.status_code})")
+     print(f"Response: {body if body else raw_text}")
+-    return False
++    return False, None
+ 
+ def read_key(valid: str, eof: str = "0") -> str:
+     valid = valid.lower()
+@@ -302,7 +296,7 @@ def edit_in_editor(text: str) -> str | None:
+ 
+ def build_torrent(job: Job) -> None:
+     print(f"Creating .torrent file from: {job.target}")
+-    torrent = Torrent(path=job.target, trackers=[ANNOUNCE_URL], private=True)
++    torrent = Torrent(path=job.target, trackers=[job.tracker.announce_url], private=True)
+     torrent.generate()
+     torrent.write(job.torrent_path, overwrite=True)
+     print("Torrent created")
+@@ -350,19 +344,40 @@ def print_description_block(job: Job) -> None:
+         print()
+     print("\n".join(job.links))
+ 
++def after_upload(job: Job, url: str | None) -> None:
++    """Add the tracker's own .torrent (from the upload response) to the download client, if one is set."""
++    name = resolve_client_name(job.tracker, job.client)
++    if not name:
++        return
++    if not url:
++        print("Client: the tracker did not return a .torrent link, nothing to add.")
++        return
++    try:
++        msg = add_release_to_client(name, job.tracker, url, job.target, job.name,
++                                    copy_to=job.out_dir / f"{job.name}.tracker.torrent")
++        print(f"Client: {msg}")
++    except (ClientError, OSError) as e:
++        print(f"Client error: {short_msg(e)}")
++
++def _upload(job: Job, plan: Plan) -> bool:
++    ok, url = post_upload(job.tracker, plan.fields, job.torrent_path, job.nfo_path)
++    if ok:
++        after_upload(job, url)
++    return ok
++
+ def upload_release(job: Job, mediainfo_text: str, extract_frames_func=None) -> bool:
+     plan = compute_plan(job, mediainfo_text)
+     if plan is None:
+         return False
+     if not CONFIRM_BEFORE_UPLOAD:
+-        return post_upload(plan.fields, job.torrent_path, job.nfo_path)
++        return _upload(job, plan)
+ 
+     while True:
+-        print_plan(plan)
++        print_plan(plan, job.tracker.name)
+         print("\n  1) Upload now\n  0) Cancel")
+         key = read_key("01")
+         if key == "1":
+-            if post_upload(plan.fields, job.torrent_path, job.nfo_path):
++            if _upload(job, plan):
+                 return True
+         elif key == "0":
+             return False
+diff --git a/src/variables.py b/src/variables.py
+new file mode 100644
+index 0000000..92eebe7
+--- /dev/null
++++ b/src/variables.py
+@@ -0,0 +1,159 @@
++"""Variables usable in description templates, e.g. "{tmdb_title} ({tmdb_year})\n\n{images}".
++
++To add a variable, write a function that takes the Job and returns a value, and
++register it with @variable. It then works in every tracker's description template and
++shows up (with its example) in the web UI's variable list. Nothing else to change.
++
++    @variable("video_bitrate", "File", "Overall bitrate", "12.4 Mb/s")
++    def _(job):
++        return ...
++
++Anything TMDB returned is also available without code as {tmdb.<field>},
++e.g. {tmdb.vote_average}, {tmdb.tagline}, {tmdb.original_title}.
++"""
++from __future__ import annotations
++import datetime
++import re
++from dataclasses import dataclass
++from typing import Callable
++
++from .core import human_size, video_duration
++from .models import Job
++
++@dataclass(frozen=True)
++class Variable:
++    name: str
++    group: str
++    description: str
++    example: str
++    func: Callable[[Job], object]
++
++REGISTRY: dict[str, Variable] = {}
++
++def variable(name: str, group: str, description: str, example: str = ""):
++    def register(func: Callable[[Job], object]) -> Callable[[Job], object]:
++        REGISTRY[name] = Variable(name, group, description, example, func)
++        return func
++    return register
++
++def _cached(job: Job, key: str, make: Callable[[], object]) -> object:
++    if key not in job.cache:
++        try:
++            job.cache[key] = make()
++        except Exception:  # a broken lookup must never break an upload
++            job.cache[key] = None
++    return job.cache[key]
++
++def _tags(job: Job) -> dict:
++    return job.tags or {}
++
++def _tmdb(job: Job, attr: str) -> object:
++    return getattr(job.info, attr, "") if job.info else ""
++
++def _tmdb_raw(job: Job, key: str) -> object:
++    value = (job.info.raw if job.info else {}).get(key, "")
++    if isinstance(value, list):
++        return ", ".join(str(v.get("name", v)) if isinstance(v, dict) else str(v) for v in value)
++    return "" if value is None else value
++
++def _torrent(job: Job):
++    def read():
++        from torf import Torrent
++        return Torrent.read(job.torrent_path)
++    return _cached(job, "torrent", read)
++
++def _hms(seconds: float | None) -> str:
++    if not seconds:
++        return ""
++    s = int(seconds)
++    return f"{s // 3600}:{s % 3600 // 60:02d}:{s % 60:02d}"
++
++# ---- TMDB ----------------------------------------------------------------
++variable("tmdb_id", "TMDB", "TMDB id", "603")(lambda job: _tmdb(job, "id") or "")
++variable("tmdb_title", "TMDB", "Title as TMDB has it", "The Matrix")(lambda job: _tmdb(job, "title"))
++variable("tmdb_year", "TMDB", "Release year", "1999")(lambda job: _tmdb(job, "year") or "")
++variable("tmdb_kind", "TMDB", "movie or tv", "movie")(lambda job: _tmdb(job, "kind"))
++variable("tmdb_label", "TMDB", "Title and year", "The Matrix (1999)")(lambda job: _tmdb(job, "label"))
++variable("overview", "TMDB", "TMDB plot summary", "A computer hacker learns...")(lambda job: job.overview or _tmdb(job, "overview"))
++variable("imdb_id", "TMDB", "IMDb id (digits)", "133093")(lambda job: _tmdb(job, "imdb_id") or "")
++variable("tvdb_id", "TMDB", "TVDB id (TV only)", "")(lambda job: _tmdb(job, "tvdb_id") or "")
++variable("tmdb_url", "TMDB", "Link to the TMDB page", "https://www.themoviedb.org/movie/603")(
++    lambda job: f"https://www.themoviedb.org/{job.info.kind}/{job.info.id}" if job.info else "")
++variable("imdb_url", "TMDB", "Link to the IMDb page", "https://www.imdb.com/title/tt0133093/")(
++    lambda job: f"https://www.imdb.com/title/tt{job.info.imdb_id:07d}/" if job.info and job.info.imdb_id else "")
++variable("tmdb_genres", "TMDB", "Genres", "Action, Science Fiction")(lambda job: _tmdb_raw(job, "genres"))
++variable("tmdb_rating", "TMDB", "Average vote (0-10)", "8.2")(lambda job: round(_tmdb_raw(job, "vote_average") or 0, 1) or "")
++variable("tmdb_tagline", "TMDB", "Tagline", "Welcome to the Real World.")(lambda job: _tmdb_raw(job, "tagline"))
++variable("tmdb_original_title", "TMDB", "Original title", "The Matrix")(
++    lambda job: _tmdb_raw(job, "original_title") or _tmdb_raw(job, "original_name"))
++variable("tmdb_release_date", "TMDB", "Release / first air date", "1999-03-31")(
++    lambda job: _tmdb_raw(job, "release_date") or _tmdb_raw(job, "first_air_date"))
++variable("tmdb_runtime", "TMDB", "Runtime in minutes (movies)", "136")(lambda job: _tmdb_raw(job, "runtime"))
++variable("tmdb_poster", "TMDB", "Poster image URL", "https://image.tmdb.org/t/p/w500/abc.jpg")(
++    lambda job: f"https://image.tmdb.org/t/p/w500{_tmdb_raw(job, 'poster_path')}" if _tmdb_raw(job, "poster_path") else "")
++
++# ---- Release / file ------------------------------------------------------
++variable("release", "File", "Release name (folder name, or file name without extension)", "The.Matrix.1999.1080p.BluRay.x264-GRP")(lambda job: job.release)
++variable("name", "File", "Name used for the output folder and torrent", "The.Matrix.1999.1080p.BluRay.x264-GRP")(lambda job: job.name)
++variable("file_name", "File", "First video file name", "The.Matrix.1999.1080p.BluRay.x264-GRP.mkv")(lambda job: job.first.name)
++variable("file_size", "File", "Size of the first video file", "8.12 GiB")(lambda job: human_size(job.first.stat().st_size))
++variable("file_size_bytes", "File", "Size of the first video file in bytes", "8719392768")(lambda job: job.first.stat().st_size)
++variable("file_count", "File", "Number of source videos (episodes)", "1")(lambda job: len(job.sources))
++variable("total_size", "File", "Combined size of all source videos", "8.12 GiB")(lambda job: human_size(sum(s.stat().st_size for s in job.sources)))
++variable("duration", "File", "Duration of the first video (h:mm:ss)", "2:16:09")(
++    lambda job: _hms(_cached(job, "duration", lambda: video_duration(job.first))))
++variable("mediainfo", "File", "Full mediainfo text", "General\nComplete name : ...")(lambda job: job.mediainfo)
++variable("resolution", "File", "Resolution tag", "1080p")(lambda job: _tags(job).get("resolution") or "")
++variable("source", "File", "Source tag", "BluRay")(lambda job: _tags(job).get("source") or "")
++variable("video_codec", "File", "Video codec", "x264")(lambda job: _tags(job).get("video") or "")
++variable("audio", "File", "Audio format", "DTS-HD MA 5.1")(lambda job: _tags(job).get("audio") or "")
++variable("hdr", "File", "HDR format", "HDR10")(lambda job: _tags(job).get("hdr") or "")
++variable("edition", "File", "Edition", "Director's Cut")(lambda job: _tags(job).get("edition") or "")
++variable("group", "File", "Release group", "GRP")(lambda job: _tags(job).get("group") or "")
++variable("season", "File", "Season number (TV)", "1")(lambda job: (_season(job) or ("", "", ""))[0])
++variable("episode", "File", "Episode number (TV; empty for season packs)", "3")(lambda job: (_season(job) or ("", "", ""))[1] or "")
++variable("season_tag", "File", "Season/episode tag (TV)", "S01E03")(lambda job: (_season(job) or ("", "", ""))[2])
++
++def _season(job: Job):
++    from .parsers import tv_numbers
++    return tv_numbers(job.sources)
++
++# ---- Torrent (the one generated locally) ---------------------------------
++variable("torrent_name", "Torrent", "Name inside the torrent", "The.Matrix.1999")(lambda job: getattr(_torrent(job), "name", ""))
++variable("torrent_size", "Torrent", "Total content size", "8.12 GiB")(lambda job: human_size(_torrent(job).size) if _torrent(job) else "")
++variable("torrent_size_bytes", "Torrent", "Total content size in bytes", "8719392768")(lambda job: getattr(_torrent(job), "size", ""))
++variable("torrent_infohash", "Torrent", "Info hash of the local torrent", "0123abcd...")(lambda job: getattr(_torrent(job), "infohash", ""))
++variable("torrent_files", "Torrent", "Number of files", "1")(lambda job: len(_torrent(job).files) if _torrent(job) else "")
++variable("torrent_piece_size", "Torrent", "Piece size", "16.00 MiB")(lambda job: human_size(_torrent(job).piece_size) if _torrent(job) else "")
++
++# ---- Upload / misc -------------------------------------------------------
++variable("images", "Images", "Hosted screenshot BBCode, one per line", "[url=...][img]...[/img][/url]")(lambda job: "\n".join(job.links))
++variable("image_count", "Images", "Number of hosted screenshots", "18")(lambda job: len(job.links))
++variable("upload_name", "Upload", "Final release title sent to the tracker", "The Matrix 1999 1080p BluRay DTS-HD MA 5.1 x264-GRP")(lambda job: job.upload_name)
++variable("tracker_name", "Upload", "Name of the tracker profile used", "odf")(lambda job: job.tracker.name if job.tracker else "")
++variable("date", "Upload", "Today (YYYY-MM-DD)", "2026-10-29")(lambda job: datetime.date.today().isoformat())
++
++_TOKEN = re.compile(r"\{([A-Za-z_][\w.]*)\}")
++
++def resolve(name: str, job: Job) -> str | None:
++    """Value for one variable, or None when the name is unknown (left untouched in the text)."""
++    if name.startswith("tmdb."):
++        value = _tmdb_raw(job, name[5:])
++    elif name in REGISTRY:
++        try:
++            value = REGISTRY[name].func(job)
++        except Exception:  # missing data (e.g. no TMDB match) renders as empty
++            value = ""
++    else:
++        return None
++    return "" if value is None else str(value)
++
++def render(template: str, job: Job) -> str:
++    def sub(m: re.Match) -> str:
++        value = resolve(m.group(1), job)
++        return m.group(0) if value is None else value
++    text = _TOKEN.sub(sub, template)
++    return re.sub(r"\n{3,}", "\n\n", text).strip()
++
++def describe_all() -> list[dict]:
++    return [{"name": v.name, "group": v.group, "description": v.description, "example": v.example} for v in REGISTRY.values()]
+diff --git a/webui/app.py b/webui/app.py
+index 77b62cd..699fe0a 100644
+--- a/webui/app.py
++++ b/webui/app.py
+@@ -13,10 +13,16 @@ from pathlib import Path
+ 
+ from flask import Flask, Response, abort, jsonify, make_response, redirect, request, send_file, send_from_directory
+ 
++import re
++
++from src.clients import CLIENT_TYPES, ClientError, make_client
++from src.config import CLIENT_DEFAULTS, DEFAULT_DESCRIPTION, TRACKER_DEFAULTS, TRACKER_SECRETS, load_raw
++from src.variables import describe_all
++
+ from .jobs import ACTIVE, OUTPUT, ROOT, STATE_DIR, JobManager, inspect_target
+ 
+ VIDEO_EXTS = {".mkv", ".mp4"}
+-SENSITIVE = ("announce_url", "tmdb_api_key", "tracker_api_token", "upload_endpoint")
++NAME_RE = re.compile(r"^[A-Za-z0-9_.-]{1,32}$")
+ BOOL_KEYS = ("confirm_before_upload", "anonymous_upload", "personal_release", "stream_optimized")
+ STR_KEYS = ("group_separator", "run_as_user")
+ MAX_ENTRIES = 5000
+@@ -98,7 +104,7 @@ def create_app(fs_root: Path, token: str, max_concurrent: int = 1) -> Flask:
+ 
+     @app.get("/api/inspect")
+     def inspect():
+-        return jsonify(inspect_target(safe_path(request.args.get("path", ""))))
++        return jsonify(inspect_target(safe_path(request.args.get("path", "")), request.args.get("tracker") or None))
+ 
+     # ---------- jobs ----------
+     @app.get("/api/jobs")
+@@ -113,6 +119,15 @@ def create_app(fs_root: Path, token: str, max_concurrent: int = 1) -> Flask:
+             abort(400, "No paths given")
+         opts = body.get("options", {})
+         clean = {k: bool(opts[k]) for k in ("review", "auto_upload", "anonymous_upload", "personal_release", "stream_optimized") if k in opts}
++        cfg = load_raw()
++        if opts.get("tracker"):
++            if opts["tracker"] not in cfg["trackers"]:
++                abort(400, f"Unknown tracker {opts['tracker']}")
++            clean["tracker"] = opts["tracker"]
++        if opts.get("client"):
++            if opts["client"] != "none" and opts["client"] not in cfg["download_clients"]:
++                abort(400, f"Unknown download client {opts['client']}")
++            clean["client"] = opts["client"]
+         created, skipped = manager.add(paths, clean)
+         return jsonify(created=created, skipped=skipped)
+ 
+@@ -146,6 +161,13 @@ def create_app(fs_root: Path, token: str, max_concurrent: int = 1) -> Flask:
+     def job_regen(jid):
+         return action(manager.regenerate, jid)
+ 
++    @app.post("/api/jobs/<jid>/client")
++    def job_client(jid):
++        client = request.get_json().get("client") or None
++        if client and client not in load_raw()["download_clients"]:
++            abort(400, "Unknown download client")
++        return action(manager.add_to_client, jid, client)
++
+     @app.post("/api/jobs/<jid>/cancel")
+     def job_cancel(jid):
+         return jsonify(ok=manager.cancel(jid))
+@@ -257,22 +279,32 @@ def create_app(fs_root: Path, token: str, max_concurrent: int = 1) -> Flask:
+         return jsonify(ok=True)
+ 
+     # ---------- settings ----------
+-    from src.config import DEFAULT_CONFIG
+-
+     def read_cfg() -> dict:
+-        cfg = dict(DEFAULT_CONFIG)
+-        try:
+-            cfg.update(json.loads((ROOT / "config.json").read_text(encoding="utf-8")))
+-        except Exception:
+-            pass
+-        return cfg
++        return load_raw()
++
++    def public_config() -> dict:
++        cfg = read_cfg()
++        set_ = lambda v: str(v or "").strip() not in ("", "#")  # noqa: E731
++        return {
++            **{k: cfg.get(k) for k in BOOL_KEYS + STR_KEYS},
++            "default_tracker": cfg["default_tracker"],
++            "secrets": {"tmdb_api_key": set_(cfg.get("tmdb_api_key"))},
++            "trackers": {n: {"description": t["description"], "download_client": t["download_client"],
++                             "secrets": {k: set_(t[k]) for k in TRACKER_SECRETS}} for n, t in cfg["trackers"].items()},
++            "download_clients": {n: {**{k: v for k, v in c.items() if k != "password"}, "password_set": bool(c.get("password"))}
++                                 for n, c in cfg["download_clients"].items()},
++            "client_types": [{"type": k, "label": c.label} for k, c in CLIENT_TYPES.items()],
++            "default_description": DEFAULT_DESCRIPTION,
++            "client_defaults": {k: v for k, v in CLIENT_DEFAULTS.items() if k != "password"},
++        }
+ 
+     @app.get("/api/config")
+     def config_get():
+-        cfg = read_cfg()
+-        out = {k: cfg.get(k) for k in BOOL_KEYS + STR_KEYS}
+-        out["secrets"] = {k: bool(str(cfg.get(k, "")).strip() not in ("", "#")) for k in SENSITIVE}
+-        return jsonify(out)
++        return jsonify(public_config())
++
++    @app.get("/api/variables")
++    def variables_list():
++        return jsonify(variables=describe_all())
+ 
+     @app.put("/api/config")
+     def config_put():
+@@ -284,10 +316,46 @@ def create_app(fs_root: Path, token: str, max_concurrent: int = 1) -> Flask:
+         for k in STR_KEYS:
+             if k in body:
+                 cfg[k] = str(body[k]).strip()
+-        for k in SENSITIVE:  # only overwritten when a new value is sent
+-            v = body.get("secrets", {}).get(k)
+-            if isinstance(v, str) and v.strip():
+-                cfg[k] = v.strip()
++        key = (body.get("secrets") or {}).get("tmdb_api_key")
++        if isinstance(key, str) and key.strip():
++            cfg["tmdb_api_key"] = key.strip()
++
++        if "trackers" in body:  # names missing from the body are deleted; secrets only change when sent
++            trackers = {}
++            for name, t in body["trackers"].items():
++                if not NAME_RE.match(name):
++                    abort(400, f"Bad tracker name {name!r} (letters, digits, . _ -)")
++                old = cfg["trackers"].get(name, TRACKER_DEFAULTS)
++                new = {"description": str(t.get("description", old["description"])).replace("\r\n", "\n") or DEFAULT_DESCRIPTION,
++                       "download_client": str(t.get("download_client", old["download_client"]) or "")}
++                for k in TRACKER_SECRETS:
++                    v = (t.get("secrets") or {}).get(k)
++                    new[k] = v.strip() if isinstance(v, str) and v.strip() else old[k]
++                trackers[name] = new
++            if not trackers:
++                abort(400, "At least one tracker is required")
++            cfg["trackers"] = trackers
++        if "download_clients" in body:
++            clients = {}
++            for name, c in body["download_clients"].items():
++                if not NAME_RE.match(name):
++                    abort(400, f"Bad client name {name!r} (letters, digits, . _ -)")
++                if c.get("type") not in CLIENT_TYPES:
++                    abort(400, f"Unknown client type {c.get('type')!r}")
++                old = cfg["download_clients"].get(name, CLIENT_DEFAULTS)
++                new = {k: (bool(c.get(k, old[k])) if isinstance(CLIENT_DEFAULTS[k], bool) else str(c.get(k, old[k]) or "").strip())
++                       for k in CLIENT_DEFAULTS if k != "password"}
++                pw = c.get("password")
++                new["password"] = pw if isinstance(pw, str) and pw != "" else old["password"]
++                clients[name] = new
++            cfg["download_clients"] = clients
++        if body.get("default_tracker"):
++            cfg["default_tracker"] = body["default_tracker"]
++        if cfg["default_tracker"] not in cfg["trackers"]:
++            abort(400, "Default tracker does not exist")
++        for t in cfg["trackers"].values():  # drop references to deleted clients
++            if t["download_client"] not in cfg["download_clients"]:
++                t["download_client"] = ""
+         path = ROOT / "config.json"
+         tmp = path.with_suffix(".tmp")
+         fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+@@ -296,6 +364,13 @@ def create_app(fs_root: Path, token: str, max_concurrent: int = 1) -> Flask:
+         tmp.replace(path)
+         return config_get()
+ 
++    @app.post("/api/clients/<name>/test")
++    def client_test(name):
++        try:
++            return jsonify(ok=True, message=make_client(name).test())
++        except ClientError as e:
++            return jsonify(ok=False, message=str(e))
++
+     @app.get("/api/tools")
+     def tools():
+         return jsonify({t: bool(shutil.which(t)) for t in ("ffmpeg", "ffprobe", "mediainfo")})
+diff --git a/webui/jobs.py b/webui/jobs.py
+index 577517f..46bf750 100644
+--- a/webui/jobs.py
++++ b/webui/jobs.py
+@@ -18,6 +18,8 @@ import uuid
+ from dataclasses import dataclass, field, asdict
+ from pathlib import Path
+ 
++from src.clients import ClientError, add_release_to_client
++from src.config import ConfigError, get_tracker, load_raw, normalize, output_dir_name
+ from src.core import find_videos, episode_videos, episode_info
+ 
+ ROOT = Path(__file__).resolve().parent.parent
+@@ -33,9 +35,10 @@ M_PLAN_END = "1) Upload now"
+ M_CONFIRM = "0) Cancel"
+ 
+ JOB_OPTION_KEYS = ("anonymous_upload", "personal_release", "stream_optimized")
++M_CLIENT = ("Client:", "Client error:")
+ 
+ 
+-def inspect_target(target: Path) -> dict:
++def inspect_target(target: Path, tracker: str | None = None) -> dict:
+     """Predict what the CLI will do with `target` (same logic as src/cli.py)."""
+     if not target.exists():
+         return {"ok": False, "error": "Path does not exist"}
+@@ -47,7 +50,8 @@ def inspect_target(target: Path) -> dict:
+     multi = len(sources) > 1
+     release = target.name if target.is_dir() else first.stem
+     name = release if multi else first.stem
+-    out_dir = f"UPLOAD.{name}"
++    tracker = tracker or load_raw()["default_tracker"]
++    out_dir = output_dir_name(name, tracker)
+     return {
+         "ok": True,
+         "videos": len(videos),
+@@ -55,6 +59,7 @@ def inspect_target(target: Path) -> dict:
+         "first": first.name,
+         "release": release,
+         "name": name,
++        "tracker": tracker,
+         "out_dir": out_dir,
+         "output_exists": (OUTPUT / out_dir).exists(),
+         "tv": any(episode_info(v) for v in videos),
+@@ -85,6 +90,9 @@ class Job:
+     hosted_total: int = 0
+     exit_code: int | None = None
+     regenerating: bool = False
++    tracker: str | None = None
++    client: str | None = None
++    client_msg: str | None = None
+ 
+     def public(self, log_count: int) -> dict:
+         d = asdict(self)
+@@ -157,16 +165,18 @@ class JobManager:
+     def add(self, paths: list[str], options: dict) -> tuple[list[dict], list[str]]:
+         created, skipped = [], []
+         with self.lock:
+-            busy = {j.target for j in self.jobs.values() if j.status in ACTIVE}
++            tracker = options.get("tracker") or load_raw()["default_tracker"]
++            busy = {(j.target, j.tracker) for j in self.jobs.values() if j.status in ACTIVE}
+             for p in paths:
+-                if p in busy:
++                if (p, tracker) in busy:
+                     skipped.append(p)
+                     continue
+-                job = Job(id=uuid.uuid4().hex[:10], target=p, options=dict(options))
++                job = Job(id=uuid.uuid4().hex[:10], target=p, options=dict(options), tracker=tracker,
++                          client=options.get("client") or None)
+                 self.jobs[job.id] = job
+                 self.order.append(job.id)
+                 self.logs[job.id] = []
+-                busy.add(p)
++                busy.add((p, tracker))
+                 created.append(job.public(0))
+         self._save()
+         self._pump()
+@@ -255,6 +265,36 @@ class JobManager:
+         threading.Thread(target=self._regen_worker, args=(job_id,), daemon=True).start()
+         return None
+ 
++    def add_to_client(self, job_id: str, client: str | None) -> str | None:
++        """Re-send an already uploaded release's tracker .torrent to a download client."""
++        with self.lock:
++            job = self.jobs.get(job_id)
++            if not job or not job.uploaded or not job.link:
++                return "Only uploaded jobs with a torrent link can be added to a client"
++            if job.status in ACTIVE:
++                return "Job is still active"
++            link, target, name, out = job.link, Path(job.target), job.name or "", job.out_dir
++            tracker_name = job.tracker
++        cfg = load_raw()
++        client = client or cfg["trackers"].get(tracker_name or "", {}).get("download_client") or ""
++        if not client:
++            return "No download client chosen (set one on the tracker or pick one)"
++        try:
++            msg = add_release_to_client(client, get_tracker(tracker_name, cfg), link, target, name,
++                                        copy_to=(OUTPUT / out / f"{name}.tracker.torrent") if out else None)
++        except (ClientError, ConfigError) as e:
++            msg = f"Client error: {e}"
++            with self.lock:
++                job.client_msg = msg
++                self._append(job_id, msg)
++            self._save()
++            return str(e)
++        with self.lock:
++            job.client_msg = f"Client: {msg}"
++            self._append(job_id, job.client_msg)
++        self._save()
++        return None
++
+     # ---------- internals ----------
+     def _write(self, job_id: str, text: str) -> None:
+         proc = self.procs.get(job_id)
+@@ -308,12 +348,7 @@ class JobManager:
+             pass
+ 
+     def _config_for(self, job: Job) -> Path:
+-        from src.config import DEFAULT_CONFIG, CONFIG_FILE
+-        cfg = dict(DEFAULT_CONFIG)
+-        try:
+-            cfg.update(json.loads(Path(ROOT / "config.json").read_text(encoding="utf-8")))
+-        except Exception:
+-            pass
++        cfg = load_raw()
+         for k in JOB_OPTION_KEYS:
+             if k in job.options:
+                 cfg[k] = bool(job.options[k])
+@@ -329,7 +364,7 @@ class JobManager:
+         job = self.jobs[jid]
+         cfg_path = None
+         try:
+-            info = inspect_target(Path(job.target))
++            info = inspect_target(Path(job.target), job.tracker)
+             if not info["ok"]:
+                 with self.lock:
+                     self._append(jid, f"Error: {info['error']}: {job.target}")
+@@ -348,8 +383,12 @@ class JobManager:
+                     return
+             cfg_path = self._config_for(job)
+             env = dict(os.environ, PYTHONUNBUFFERED="1", PYTHONPATH="src", AAODF_CONFIG=str(cfg_path))
++            cmd = [sys.executable, "-m", "src", "--tracker", job.tracker or ""]
++            if job.client:
++                cmd += ["--client", job.client]
++            cmd.append(job.target)
+             proc = subprocess.Popen(
+-                [sys.executable, "-m", "src", job.target], cwd=ROOT, env=env,
++                cmd, cwd=ROOT, env=env,
+                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                 text=True, encoding="utf-8", errors="replace", bufsize=1, start_new_session=True,
+             )
+@@ -439,6 +478,8 @@ class JobManager:
+         elif s.startswith("Upload successful"):
+             job.uploaded = True
+             job.error = None
++        elif s.startswith(M_CLIENT):
++            job.client_msg = s
+         elif s.startswith("Link:"):
+             job.link = s.split(":", 1)[1].strip()
+         elif s.startswith(("Upload failed", "Response:")):
+diff --git a/webui/static/app.js b/webui/static/app.js
+index b975c94..4207380 100644
+--- a/webui/static/app.js
++++ b/webui/static/app.js
+@@ -207,7 +207,7 @@ function drawList() {
+ 
+ function cfgDefaults() {
+   const c = state.config || {};
+-  return { review: true, auto_upload: c.confirm_before_upload === false, anonymous_upload: !!c.anonymous_upload, personal_release: !!c.personal_release, stream_optimized: !!c.stream_optimized };
++  return { tracker: c.default_tracker || "", client: "", review: true, auto_upload: c.confirm_before_upload === false, anonymous_upload: !!c.anonymous_upload, personal_release: !!c.personal_release, stream_optimized: !!c.stream_optimized };
+ }
+ 
+ function drawTray() {
+@@ -222,6 +222,13 @@ function drawTray() {
+       h("span", { title: p }, "‎" + p)))) : h("p", { class: "muted" }, "Tick files or folders (a video file, or a release folder) to run the script on."),
+     ...[...state.selected.keys()].filter((p) => files.inspect[p]).map((p) => h("div", { class: "insp" }, describe(p, files.inspect[p]))),
+     h("div", { class: "opts" },
++      h("div", { class: "row" },
++        h("label", { class: "grow" }, "Tracker", h("select", { class: "sel", onchange: (e) => { o.tracker = e.target.value; files.inspect = {}; drawTray(); } },
++          Object.keys((state.config || {}).trackers || {}).map((t) => h("option", { value: t, selected: t === o.tracker }, t + (t === (state.config || {}).default_tracker ? " (default)" : ""))))),
++        h("label", { class: "grow" }, "Download client", h("select", { class: "sel", onchange: (e) => { o.client = e.target.value; } },
++          h("option", { value: "", selected: !o.client }, "Tracker's default"),
++          h("option", { value: "none", selected: o.client === "none" }, "Don't add"),
++          Object.keys((state.config || {}).download_clients || {}).map((c) => h("option", { value: c, selected: c === o.client }, c))))),
+       opt("review", "Pause to review images before they are hosted", "Matches the CLI's ‘delete unwanted images’ pause"),
+       opt("auto_upload", "Upload to tracker without asking", "Skips the final confirmation"),
+       opt("anonymous_upload", "Anonymous upload"), opt("personal_release", "Personal release"), opt("stream_optimized", "Stream optimised")),
+@@ -239,7 +246,7 @@ function describe(p, i) {
+ 
+ async function inspectAll() {
+   for (const p of state.selected.keys()) {
+-    files.inspect[p] = await api("GET", "/api/inspect?path=" + enc(p)).catch((e) => ({ ok: false, error: e.message }));
++    files.inspect[p] = await api("GET", "/api/inspect?path=" + enc(p) + "&tracker=" + enc(files.opts.tracker || "")).catch((e) => ({ ok: false, error: e.message }));
+     drawTray();
+   }
+ }
+@@ -277,7 +284,18 @@ function drawJobsList() {
+   jobsUI.list.replaceChildren(...(jobs.length ? jobs.map((j) => h("div", { class: "job " + j.status + (state.openJob === j.id ? " open" : ""), onclick: () => { state.openJob = j.id; drawJobsList(); drawJobDetail(true); } },
+     h("div", { class: "row" }, h("div", { class: "title grow", title: j.target }, j.name || j.target.split("/").pop()), h("span", { class: "pill " + j.status }, STATUS_TEXT[j.status] || j.status)),
+     h("div", { class: "bar" }, h("div", { style: `width:${j.status === "finished" && j.uploaded ? 100 : j.percent}%` })),
+-    h("div", { class: "muted small" }, jobLine(j)))) : [h("div", { class: "empty" }, "No jobs yet. Pick files on the Files tab.")]));
++    h("div", { class: "muted small" }, (multiTracker() ? `[${j.tracker}] ` : "") + jobLine(j)),
++    j.client_msg && h("div", { class: "muted small" }, j.client_msg))) : [h("div", { class: "empty" }, "No jobs yet. Pick files on the Files tab.")]));
++}
++
++const multiTracker = () => Object.keys((state.config || {}).trackers || {}).length > 1;
++
++function clientControls(j) {
++  const clients = Object.keys((state.config || {}).download_clients || {});
++  if (!(j.status === "finished" && j.uploaded && j.link) || !clients.length) return null;
++  const pick = h("select", { class: "sel" }, h("option", { value: "" }, "Tracker's default"), clients.map((c) => h("option", { value: c }, c)));
++  return h("div", { class: "row" }, h("span", { class: "muted" }, "Download client:"), pick,
++    h("button", { class: "btn", onclick: guard(async () => { await api("POST", `/api/jobs/${j.id}/client`, { client: pick.value }); toast("Added to client"); await refreshJobs(); }) }, "Add torrent to client"));
+ }
+ 
+ function jobLine(j) {
+@@ -291,7 +309,7 @@ function jobLine(j) {
+ function drawJobDetail(force) {
+   const j = state.jobs.find((x) => x.id === state.openJob);
+   if (!j) { jobsUI.detail.replaceChildren(h("div", { class: "panel muted" }, "Select a job to see progress, images and the log.")); jobsUI.logJob = null; jobsUI.galleryDir = null; return; }
+-  const sig = JSON.stringify([j.id, j.status, j.stage, j.regenerating, j.plan, j.error, j.link, Math.floor(j.percent / 5)]);
++  const sig = JSON.stringify([j.id, j.status, j.stage, j.regenerating, j.plan, j.error, j.link, j.client_msg, Math.floor(j.percent / 5)]);
+   const hasImages = j.out_dir && ["frames", "review", "hosting", "finalize", "confirm", "uploading", "finished", "failed", "cancelled"].includes(j.stage) || (j.out_dir && !isActive(j));
+   if (force || sig !== jobsUI.sig || jobsUI.logJob !== j.id) {
+     jobsUI.sig = sig;
+@@ -309,7 +327,10 @@ function drawJobDetail(force) {
+       h("div", { class: "bar" }, h("div", { style: `width:${done && j.uploaded ? 100 : j.percent}%` })),
+       h("div", { class: "steps" }, STEPS.map((s, i) => h("span", { class: done ? "past" : i < cur ? "past" : i === cur && isActive(j) ? "now" : "" }, s))),
+       j.error && h("div", { class: "err" }, j.error),
++      h("div", { class: "muted small" }, "Tracker: " + (j.tracker || "default")),
+       j.link && h("div", {}, "Link: ", h("a", { href: j.link, target: "_blank", rel: "noreferrer noopener" }, j.link)),
++      j.client_msg && h("div", { class: j.client_msg.startsWith("Client error") ? "err" : "" }, j.client_msg),
++      clientControls(j),
+       reviewControls(j), confirmControls(j),
+       h("div", { class: "row" },
+         isActive(j) && h("button", { class: "btn danger", onclick: guard(async () => { if (confirm("Cancel this job?")) { await api("POST", `/api/jobs/${j.id}/cancel`, {}); await refreshJobs(); } }) }, "Cancel job"),
+@@ -388,21 +409,125 @@ function libOpen(name) {
+ }
+ 
+ /* ---------------- SETTINGS tab ---------------- */
++let varsCache = null, lastArea = null;
++
+ const settingsLoad = guard(async () => {
+   const c = state.config = await api("GET", "/api/config");
+-  const draft = { secrets: {} };
+-  const bool = (k, label) => h("label", { class: "chk" }, h("input", { type: "checkbox", checked: !!c[k], onchange: (e) => (draft[k] = e.target.checked) }), label);
+-  const secret = (k, label) => h("div", { class: "f" }, h("label", {}, label, " ", h("span", { class: "muted small" }, c.secrets[k] ? "(set – leave blank to keep)" : "(not set)")),
+-    h("input", { type: "password", autocomplete: "off", placeholder: c.secrets[k] ? "••••••••" : "", oninput: (e) => (draft.secrets[k] = e.target.value) }));
+-  $("#tab-settings").replaceChildren(h("div", { class: "panel form" },
+-    h("h2", {}, "Settings (config.json)"),
+-    secret("announce_url", "Announce URL"), secret("tmdb_api_key", "TMDB API key"), secret("tracker_api_token", "Tracker API token"), secret("upload_endpoint", "Upload endpoint"),
+-    bool("confirm_before_upload", "Confirm before upload"), bool("anonymous_upload", "Anonymous upload"), bool("personal_release", "Personal release"), bool("stream_optimized", "Stream optimised"),
+-    h("div", { class: "f" }, h("label", {}, "Group separator"), h("input", { type: "text", value: c.group_separator, oninput: (e) => (draft.group_separator = e.target.value) })),
+-    h("div", { class: "muted small" }, "Secrets are never sent back to the browser. ‘Run as user’ from the CLI is not used by the web UI; jobs run as the user running the server."),
+-    h("div", {}, h("button", { class: "btn primary", onclick: guard(async () => { await api("PUT", "/api/config", draft); toast("Saved"); files.opts = null; settingsLoad(); }) }, "Save"))));
++  if (!varsCache) varsCache = (await api("GET", "/api/variables")).variables;
++  const d = {
++    flags: Object.fromEntries(["confirm_before_upload", "anonymous_upload", "personal_release", "stream_optimized"].map((k) => [k, !!c[k]])),
++    group_separator: c.group_separator, tmdb_key: "", default_tracker: c.default_tracker,
++    trackers: Object.fromEntries(Object.entries(c.trackers).map(([n, t]) => [n, { ...t, secrets: {}, saved: true }])),
++    clients: Object.fromEntries(Object.entries(c.download_clients).map(([n, x]) => [n, { ...x, password: "", saved: true }])),
++  };
++  drawSettings(c, d);
+ });
+ 
++function field(label, input, hint) {
++  return h("div", { class: "f" }, h("label", {}, label, hint && h("span", { class: "muted small" }, " " + hint)), input);
++}
++function textIn(obj, key, o = {}) {
++  return h("input", { type: o.password ? "password" : "text", autocomplete: "off", value: o.password ? "" : (obj[key] ?? ""), placeholder: o.placeholder || "",
++    oninput: (e) => { obj[key] = e.target.value; } });
++}
++
++function drawSettings(c, d) {
++  const redraw = () => drawSettings(c, d);
++  const clientNames = Object.keys(d.clients);
++
++  const trackerCard = (name, t) => h("div", { class: "panel form wide" },
++    h("div", { class: "row" },
++      h("h2", { class: "grow", style: "margin:0" }, name),
++      h("label", { class: "chk" }, h("input", { type: "radio", name: "deftracker", checked: d.default_tracker === name, onchange: () => { d.default_tracker = name; } }), "Default"),
++      h("button", { class: "btn danger", disabled: Object.keys(d.trackers).length < 2, onclick: () => {
++        if (!confirm(`Remove tracker ${name}?`)) return;
++        delete d.trackers[name]; if (d.default_tracker === name) d.default_tracker = Object.keys(d.trackers)[0]; redraw();
++      } }, "Remove")),
++    ...[["announce_url", "Announce URL"], ["api_token", "API token"], ["upload_endpoint", "Upload endpoint"]].map(([k, label]) =>
++      field(label, textIn(t.secrets, k, { password: true, placeholder: t.saved && c.trackers[name].secrets[k] ? "•••••••• (leave blank to keep)" : "" }),
++        t.saved && c.trackers[name].secrets[k] ? "set" : "not set")),
++    field("Download client", h("select", { class: "sel", onchange: (e) => { t.download_client = e.target.value; } },
++      h("option", { value: "" }, "None – don't add after upload"), clientNames.map((n) => h("option", { value: n, selected: n === t.download_client }, n))),
++      "gets the tracker's own .torrent after a successful upload"),
++    (() => {
++      const ta = h("textarea", { class: "mono", rows: 7, value: t.description, oninput: (e) => { t.description = e.target.value; }, onfocus: (e) => { lastArea = { el: e.target, t }; } });
++      return field("Description", ta, "template – see the variables below");
++    })(),
++    h("div", {}, h("button", { class: "btn small", onclick: () => { t.description = c.default_description; redraw(); } }, "Reset description to default")));
++
++  const clientCard = (name, x) => h("div", { class: "panel form wide" },
++    h("div", { class: "row" }, h("h2", { class: "grow", style: "margin:0" }, name),
++      h("button", { class: "btn", disabled: !x.saved, title: x.saved ? "" : "Save first", onclick: guard(async () => {
++        const r = await api("POST", `/api/clients/${enc(name)}/test`, {}); toast((r.ok ? "OK: " : "Failed: ") + r.message, !r.ok);
++      }) }, "Test saved connection"),
++      h("button", { class: "btn danger", onclick: () => { if (!confirm(`Remove client ${name}?`)) return; delete d.clients[name]; redraw(); } }, "Remove")),
++    field("Type", h("select", { class: "sel", onchange: (e) => { x.type = e.target.value; redraw(); } }, c.client_types.map((t) => h("option", { value: t.type, selected: t.type === x.type }, t.label)))),
++    field("URL", textIn(x, "url"), x.type === "deluge" ? "Web UI address" : "Web UI / RPC address"),
++    h("div", { class: "row2" }, field("Username", textIn(x, "username")),
++      field("Password", textIn(x, "password", { password: true, placeholder: x.saved && x.password_set ? "•••••• (leave blank to keep)" : "" }))),
++    field("Save path", textIn(x, "save_path", { placeholder: "empty = folder containing the uploaded content" })),
++    h("div", { class: "row2" }, field("Local path prefix", textIn(x, "local_path", { placeholder: "/mnt/media" }), "optional"),
++      field("…as the client sees it", textIn(x, "remote_path", { placeholder: "/data" }))),
++    h("div", { class: "row2" }, field("Category / label", textIn(x, "category")), field("Tags", textIn(x, "tags"), "comma separated")),
++    h("div", { class: "row" },
++      h("label", { class: "chk" }, h("input", { type: "checkbox", checked: !!x.paused, onchange: (e) => (x.paused = e.target.checked) }), "Add paused"),
++      x.type === "qbittorrent" && h("label", { class: "chk" }, h("input", { type: "checkbox", checked: !!x.skip_checking, onchange: (e) => (x.skip_checking = e.target.checked) }), "Skip hash check")));
++
++  const newTracker = h("input", { type: "text", placeholder: "new tracker name" });
++  const newClient = h("input", { type: "text", placeholder: "new client name" });
++  const newClientType = h("select", { class: "sel" }, c.client_types.map((t) => h("option", { value: t.type }, t.label)));
++  const groups = [...new Set(varsCache.map((v) => v.group))];
++
++  $("#tab-settings").replaceChildren(
++    h("div", { class: "panel form wide" }, h("h2", {}, "General"),
++      field("TMDB API key", textIn(d, "tmdb_key", { password: true, placeholder: c.secrets.tmdb_api_key ? "•••••••• (leave blank to keep)" : "" }), c.secrets.tmdb_api_key ? "set" : "not set"),
++      ...[["confirm_before_upload", "Confirm before upload"], ["anonymous_upload", "Anonymous upload"], ["personal_release", "Personal release"], ["stream_optimized", "Stream optimised"]].map(([k, l]) =>
++        h("label", { class: "chk" }, h("input", { type: "checkbox", checked: d.flags[k], onchange: (e) => (d.flags[k] = e.target.checked) }), l)),
++      field("Group separator", textIn(d, "group_separator"))),
++
++    h("h2", { class: "sect" }, "Trackers"),
++    ...Object.entries(d.trackers).map(([n, t]) => trackerCard(n, t)),
++    h("div", { class: "row" }, newTracker, h("button", { class: "btn", onclick: () => {
++      const n = newTracker.value.trim();
++      if (!/^[A-Za-z0-9_.-]{1,32}$/.test(n) || d.trackers[n]) return toast("Use a unique name (letters, digits, . _ -)", true);
++      d.trackers[n] = { description: c.default_description, download_client: "", secrets: {}, saved: false }; redraw();
++    } }, "Add tracker")),
++    h("div", { class: "muted small" }, "Uploads use the same category/type/resolution id mapping for every tracker; each tracker has its own URLs, token, description and client."),
++
++    h("h2", { class: "sect" }, "Download clients"),
++    ...Object.entries(d.clients).map(([n, x]) => clientCard(n, x)),
++    h("div", { class: "row" }, newClient, newClientType, h("button", { class: "btn", onclick: () => {
++      const n = newClient.value.trim();
++      if (!/^[A-Za-z0-9_.-]{1,32}$/.test(n) || d.clients[n]) return toast("Use a unique name (letters, digits, . _ -)", true);
++      d.clients[n] = { ...c.client_defaults, type: newClientType.value, password: "", saved: false }; redraw();
++    } }, "Add client")),
++
++    h("details", { class: "panel", style: "margin-top:16px" }, h("summary", {}, "Description variables (click to insert into the focused description)"),
++      h("p", { class: "muted small" }, "Write {name} in a description. Anything TMDB returns also works as {tmdb.<field>}, e.g. {tmdb.vote_average}. Unknown names are left as written."),
++      ...groups.map((g) => h("div", {}, h("strong", {}, g), h("div", { class: "chips" }, varsCache.filter((v) => v.group === g).map((v) =>
++        h("button", { class: "chip", title: `${v.description}${v.example ? "\nExample: " + v.example : ""}`, onclick: () => insertVar(v.name) }, `{${v.name}}`)))))),
++
++    h("div", { class: "savebar" }, h("button", { class: "btn primary", onclick: guard(async () => {
++      const body = {
++        ...d.flags, group_separator: d.group_separator, default_tracker: d.default_tracker,
++        secrets: { tmdb_api_key: d.tmdb_key },
++        trackers: Object.fromEntries(Object.entries(d.trackers).map(([n, t]) => [n, { description: t.description, download_client: t.download_client, secrets: t.secrets }])),
++        download_clients: Object.fromEntries(Object.entries(d.clients).map(([n, x]) => {
++          const { saved, password_set, ...rest } = x; return [n, rest];
++        })),
++      };
++      await api("PUT", "/api/config", body); toast("Saved"); files.opts = null; settingsLoad();
++    }) }, "Save settings")));
++}
++
++function insertVar(name) {
++  if (!lastArea || !lastArea.el.isConnected) return toast("Click into a description box first", true);
++  const { el, t } = lastArea, a = el.selectionStart, b = el.selectionEnd, tok = `{${name}}`;
++  el.value = el.value.slice(0, a) + tok + el.value.slice(b);
++  el.selectionStart = el.selectionEnd = a + tok.length; el.focus();
++  t.description = el.value;
++}
++
+ /* ---------------- tabs / boot ---------------- */
+ function switchTab(tab) {
+   state.tab = tab;
+diff --git a/webui/static/style.css b/webui/static/style.css
+index 7a56b15..f325d8c 100644
+--- a/webui/static/style.css
++++ b/webui/static/style.css
+@@ -97,3 +97,14 @@ pre.log { background: #0f1217; color: #cfd6e4; padding: 10px; border-radius: 8px
+ #toast { position: fixed; bottom: 18px; left: 50%; transform: translateX(-50%); background: var(--text); color: var(--bg); padding: 8px 16px; border-radius: 8px; z-index: 30; max-width: 90vw; }
+ .form { display: grid; gap: 12px; max-width: 560px; }
+ .form .f { display: grid; gap: 4px; }
++
++select.sel { background: var(--bg); color: var(--text); border: 1px solid var(--line); border-radius: 6px; padding: 6px 9px; font: inherit; width: 100%; }
++textarea.mono { background: var(--bg); color: var(--text); border: 1px solid var(--line); border-radius: 6px; padding: 8px; font: 12px/1.5 ui-monospace, monospace; width: 100%; resize: vertical; }
++.form.wide { max-width: 720px; margin-bottom: 12px; }
++.row2 { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
++h2.sect { margin: 22px 0 10px; }
++.chips { display: flex; flex-wrap: wrap; gap: 5px; margin: 6px 0 12px; }
++.chip { background: var(--bg); color: var(--accent); border: 1px solid var(--line); border-radius: 12px; padding: 2px 9px; font: 12px ui-monospace, monospace; cursor: pointer; }
++.chip:hover { border-color: var(--accent); }
++.savebar { position: sticky; bottom: 0; background: var(--bg); padding: 12px 0; margin-top: 14px; }
++.opts .row > label { display: grid; gap: 3px; font-size: 12px; color: var(--muted); }
+-- 
+2.43.0
+

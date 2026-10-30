@@ -8,14 +8,9 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from .models import Job
 
-from .config import (
-    FRAME_COUNT
-)
+from .config import get_screenshot_settings
 
 VIDEO_EXTS = {".mkv", ".mp4"}
-FIRST_FRAME_AT = 60
-#FRAME_COUNT = 18
-FRAME_STEP = 240
 FRAME_WORKERS = 4
 
 _EPISODE_RE = re.compile(r"(?<![A-Za-z0-9])S(\d{1,3})[ ._-]?E(\d{1,4})(?![0-9])", re.I)
@@ -116,7 +111,7 @@ def extract_frame(video: Path, ts: int, out: Path) -> str | None:
         return short_msg(r.stderr) or "no frame produced"
     return None
 
-def plan_episode_frames(videos: list[Path], workers: int) -> list[tuple[Path, int]]:
+def plan_episode_frames(videos: list[Path], workers: int, frame_count: int) -> list[tuple[Path, int]]:
     with ThreadPoolExecutor(max_workers=workers) as pool:
         durations = list(pool.map(video_duration, videos))
     usable = [(v, d) for v, d in zip(videos, durations) if d and d > 60]
@@ -124,11 +119,13 @@ def plan_episode_frames(videos: list[Path], workers: int) -> list[tuple[Path, in
     if n == 0:
         return []
 
-    if n >= FRAME_COUNT:
-        picks = {round(i * (n - 1) / (FRAME_COUNT - 1)) for i in range(FRAME_COUNT)}
+    if n >= frame_count:
+        picks = {n // 2} if frame_count == 1 else {
+            round(i * (n - 1) / (frame_count - 1)) for i in range(frame_count)
+        }
         counts = {i: 1 for i in picks}
     else:
-        counts = {i: (FRAME_COUNT * (i + 1)) // n - (FRAME_COUNT * i) // n for i in range(n)}
+        counts = {i: (frame_count * (i + 1)) // n - (frame_count * i) // n for i in range(n)}
 
     plan = []
     for i in sorted(counts):
@@ -141,15 +138,16 @@ def plan_episode_frames(videos: list[Path], workers: int) -> list[tuple[Path, in
     return plan
 
 def extract_frames(videos: list[Path], name: str, out_dir: Path, jitter: bool = False) -> None:
+    frame_count, first_frame_at, frame_step = get_screenshot_settings()
     workers = min(FRAME_WORKERS, os.cpu_count() or 1)
     jobs = []
     if len(videos) == 1:
         video = videos[0]
         duration = video_duration(video)
-        for i in range(FRAME_COUNT):
-            ts = FIRST_FRAME_AT + i * FRAME_STEP
+        for i in range(frame_count):
+            ts = first_frame_at + i * frame_step
             if jitter:
-                reach = FRAME_STEP // 2 - 20
+                reach = max(0, frame_step // 2 - 20)
                 ts = max(5, ts + random.randint(-reach, reach))
             if duration is not None and ts >= duration:
                 continue
@@ -157,7 +155,7 @@ def extract_frames(videos: list[Path], name: str, out_dir: Path, jitter: bool = 
             jobs.append((i + 1, video, ts, out, f"at {ts}s"))
         print(f"Extracting {len(jobs)} frames ({workers} at a time)...")
     else:
-        plan = plan_episode_frames(videos, workers)
+        plan = plan_episode_frames(videos, workers, frame_count)
         for i, (video, ts) in enumerate(plan):
             out = out_dir / f"{name}_frame_{i + 1:02d}.png"
             jobs.append((i + 1, video, ts, out, f"{episode_label(video)} at {ts}s"))
@@ -171,7 +169,7 @@ def extract_frames(videos: list[Path], name: str, out_dir: Path, jitter: bool = 
         for idx, label, fut in futures:
             if fut.result() is None:
                 ok_count += 1
-                print(f"  Frame {idx:>2}/{FRAME_COUNT} {label}: done")
+                print(f"  Frame {idx:>2}/{len(jobs)} {label}: done")
             else:
-                print(f"  Frame {idx:>2}/{FRAME_COUNT} {label}: FAILED")
+                print(f"  Frame {idx:>2}/{len(jobs)} {label}: FAILED")
     print(f"Extracted {ok_count} frames to: {out_dir}")

@@ -1,13 +1,17 @@
 {
-  "announce_url": "#",
-  "tmdb_api_key": "#",
-  "tracker_api_token": "#",
-  "upload_endpoint": "#",
-  "confirm_before_upload": true,
-  "anonymous_upload": false,
-  "personal_release": false,
-  "stream_optimized": false,
-  "group_separator": "-",
-  "run_as_user": "",
-  "frame_count": 8
+    "announce_url": "#",
+    "tmdb_api_key": "#",
+    "tracker_api_token": "#",
+    "upload_endpoint": "#",
+    "tracker_search_endpoint": "",
+    "confirm_before_upload": true,
+    "anonymous_upload": false,
+    "personal_release": false,
+    "stream_optimized": false,
+    "group_separator": "-",
+    "run_as_user": "",
+    "download_client": null,
+    "screenshot_count": 18,
+    "screenshot_start_seconds": 60,
+    "screenshot_interval_seconds": 240
 }

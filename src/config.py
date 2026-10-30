@@ -17,7 +17,11 @@ DEFAULT_CONFIG = {
     "stream_optimized": False,
     "group_separator": "-",
     "run_as_user": "",
-    "frame_count": 18
+    "tracker_search_endpoint": "",
+    "download_client": None,
+    "screenshot_count": 18,
+    "screenshot_start_seconds": 60,
+    "screenshot_interval_seconds": 240
 }
 
 TYPE_IDS = {
@@ -51,10 +55,30 @@ ANNOUNCE_URL = config.get("announce_url", "#")
 TMDB_API_KEY = config.get("tmdb_api_key", "#")
 TRACKER_API_TOKEN = config.get("tracker_api_token", "#")
 UPLOAD_ENDPOINT = config.get("upload_endpoint", "#")
+TRACKER_SEARCH_ENDPOINT = config.get("tracker_search_endpoint", "").strip()
 CONFIRM_BEFORE_UPLOAD = config.get("confirm_before_upload", True)
 ANONYMOUS_UPLOAD = config.get("anonymous_upload", False)
 PERSONAL_RELEASE = config.get("personal_release", False)
 STREAM_OPTIMIZED = config.get("stream_optimized", False)
 GROUP_SEPARATOR = config.get("group_separator", "-")
 RUN_AS_USER = config.get("run_as_user", "").strip()
-FRAME_COUNT = config.get("frame_count", 18)
+
+def get_screenshot_settings() -> tuple[int, int, int]:
+    """Read screenshot settings for the active config, including per-job overrides."""
+    data = load_config()
+
+    def setting(key: str, default: int, minimum: int) -> int:
+        value = data.get(key, default)
+        if isinstance(value, bool):
+            return default
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError, OverflowError):
+            return default
+        return parsed if parsed >= minimum else default
+
+    return (
+        setting("screenshot_count", 18, 1),
+        setting("screenshot_start_seconds", 60, 0),
+        setting("screenshot_interval_seconds", 240, 1),
+    )

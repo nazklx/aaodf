@@ -14,11 +14,14 @@ from pathlib import Path
 from flask import Flask, Response, abort, jsonify, make_response, redirect, request, send_file, send_from_directory
 
 from .jobs import ACTIVE, OUTPUT, ROOT, STATE_DIR, JobManager, inspect_target
+from src.core import find_videos
+from src.tracker import search_tracker, tracker_search_title
 
 VIDEO_EXTS = {".mkv", ".mp4"}
 SENSITIVE = ("announce_url", "tmdb_api_key", "tracker_api_token", "upload_endpoint")
 BOOL_KEYS = ("confirm_before_upload", "anonymous_upload", "personal_release", "stream_optimized")
-STR_KEYS = ("group_separator", "run_as_user")
+STR_KEYS = ("group_separator", "run_as_user", "tracker_search_endpoint")
+NUM_KEYS = ("screenshot_count", "screenshot_start_seconds", "screenshot_interval_seconds")
 MAX_ENTRIES = 5000
 COOKIE = "aaodf_token"
 
@@ -99,6 +102,43 @@ def create_app(fs_root: Path, token: str, max_concurrent: int = 1) -> Flask:
     @app.get("/api/inspect")
     def inspect():
         return jsonify(inspect_target(safe_path(request.args.get("path", ""))))
+
+    @app.post("/api/duplicates/scan")
+    def duplicate_scan():
+        body = request.get_json() or {}
+        raw_directory = str(body.get("path", "")).strip()
+        if not raw_directory:
+            abort(400, "Select a download directory")
+        directory = safe_path(raw_directory)
+        if not directory.is_dir():
+            abort(400, "Select a valid download directory")
+
+        candidates = [p for p in directory.iterdir() if not p.name.startswith(".") and p.is_dir()]
+        candidates += [p for p in directory.iterdir() if p.is_file() and p.suffix.lower() in VIDEO_EXTS]
+        candidates.sort(key=lambda p: (not p.is_dir(), p.name.casefold()))
+        if len(candidates) > MAX_ENTRIES:
+            abort(413, f"Directory contains more than {MAX_ENTRIES} immediate entries")
+        results = []
+        for candidate in candidates:
+            query = tracker_search_title(candidate.name)
+            try:
+                matches = search_tracker(query)
+            except Exception as exc:
+                app.logger.warning("Duplicate scan failed for %s: %s", candidate, exc)
+                abort(502, f"Tracker search failed for {candidate.name}: {exc}. No batch was created.")
+
+            eligible = not candidate.is_dir() or bool(find_videos(candidate))
+            results.append({
+                "path": str(candidate),
+                "name": candidate.name,
+                "kind": "folder" if candidate.is_dir() else "file",
+                "query": query,
+                "matches": matches[:10],
+                "match_count": len(matches),
+                "eligible": eligible,
+                "status": "matched" if matches else ("unmatched" if eligible else "skipped"),
+            })
+        return jsonify(path=str(directory), scanned=len(candidates), results=results)
 
     # ---------- jobs ----------
     @app.get("/api/jobs")
@@ -270,13 +310,19 @@ def create_app(fs_root: Path, token: str, max_concurrent: int = 1) -> Flask:
     @app.get("/api/config")
     def config_get():
         cfg = read_cfg()
-        out = {k: cfg.get(k) for k in BOOL_KEYS + STR_KEYS}
+        out = {k: cfg.get(k) for k in BOOL_KEYS + STR_KEYS + NUM_KEYS}
+        client = cfg.get("download_client")
+        if isinstance(client, dict) and client:
+            out["download_client"] = {k: client.get(k, "") for k in ("type", "url", "username", "category", "tags", "save_path", "download_dir")}
+            out["download_client"]["password_set"] = bool(client.get("password"))
+        else:
+            out["download_client"] = None
         out["secrets"] = {k: bool(str(cfg.get(k, "")).strip() not in ("", "#")) for k in SENSITIVE}
         return jsonify(out)
 
     @app.put("/api/config")
     def config_put():
-        body = request.get_json()
+        body = request.get_json() or {}
         cfg = read_cfg()
         for k in BOOL_KEYS:
             if k in body:
@@ -284,6 +330,39 @@ def create_app(fs_root: Path, token: str, max_concurrent: int = 1) -> Flask:
         for k in STR_KEYS:
             if k in body:
                 cfg[k] = str(body[k]).strip()
+        limits = {
+            "screenshot_count": (1, 200),
+            "screenshot_start_seconds": (0, 86400),
+            "screenshot_interval_seconds": (1, 86400),
+        }
+        for k, (minimum, maximum) in limits.items():
+            if k in body:
+                value = body[k]
+                if isinstance(value, bool):
+                    abort(400, f"{k} must be an integer")
+                try:
+                    value = int(value)
+                except (TypeError, ValueError, OverflowError):
+                    abort(400, f"{k} must be an integer")
+                if not minimum <= value <= maximum:
+                    abort(400, f"{k} must be between {minimum} and {maximum}")
+                cfg[k] = value
+        if "download_client" in body:
+            incoming = body["download_client"]
+            if incoming is None or incoming == {}:
+                cfg["download_client"] = None
+            elif isinstance(incoming, dict):
+                kind = str(incoming.get("type", "")).strip().lower()
+                url = str(incoming.get("url", "")).strip()
+                if kind not in ("qbittorrent", "transmission") or not url:
+                    abort(400, "Download client needs a supported type and URL")
+                previous = cfg.get("download_client") if isinstance(cfg.get("download_client"), dict) else {}
+                client = {k: str(incoming.get(k, previous.get(k, ""))).strip() for k in ("type", "url", "username", "category", "tags", "save_path", "download_dir")}
+                password = incoming.get("password")
+                client["password"] = str(password) if isinstance(password, str) and password else str(previous.get("password", ""))
+                cfg["download_client"] = client
+            else:
+                abort(400, "download_client must be an object or null")
         for k in SENSITIVE:  # only overwritten when a new value is sent
             v = body.get("secrets", {}).get(k)
             if isinstance(v, str) and v.strip():

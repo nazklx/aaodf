@@ -97,3 +97,18 @@ pre.log { background: #0f1217; color: #cfd6e4; padding: 10px; border-radius: 8px
 #toast { position: fixed; bottom: 18px; left: 50%; transform: translateX(-50%); background: var(--text); color: var(--bg); padding: 8px 16px; border-radius: 8px; z-index: 30; max-width: 90vw; }
 .form { display: grid; gap: 12px; max-width: 560px; }
 .form .f { display: grid; gap: 4px; }
+
+/* duplicate scanner and server-side directory picker */
+.dup-list { display: grid; gap: 6px; margin: 10px 0; }
+.dup-item { display: flex; gap: 10px; align-items: flex-start; padding: 8px 10px; border: 1px solid var(--line); border-radius: 7px; background: var(--bg); min-width: 0; }
+.dup-item > span { display: grid; gap: 2px; min-width: 0; overflow-wrap: anywhere; }
+.dup-item input { margin-top: 3px; }
+.dup-item.matched { align-items: flex-start; }
+.match-line { color: var(--muted); font-size: 12px; padding-top: 3px; }
+.picker-backdrop { position: fixed; inset: 0; z-index: 40; background: rgba(0,0,0,.55); display: grid; place-items: center; padding: 18px; }
+.picker { width: min(680px, 96vw); max-height: 85vh; display: flex; flex-direction: column; gap: 10px; box-shadow: 0 12px 50px rgba(0,0,0,.25); }
+.picker-list { overflow: auto; min-height: 120px; max-height: 55vh; border: 1px solid var(--line); border-radius: 7px; padding: 5px; }
+.picker-entry { display: block; width: 100%; text-align: left; padding: 7px 9px; background: transparent; border: 0; border-radius: 5px; color: var(--text); font: inherit; cursor: pointer; }
+.picker-entry:hover { background: var(--sel); }
+.subform { display: grid; gap: 8px; padding: 10px; border: 1px solid var(--line); border-radius: 8px; }
+.subform select { background: var(--bg); color: var(--text); border: 1px solid var(--line); border-radius: 6px; padding: 7px 9px; font: inherit; }

@@ -57,7 +57,7 @@ const enc = encodeURIComponent;
 
 const state = {
   tab: "files", fs: null, hidden: false, filter: "", selected: new Map(),
-  jobs: [], maxConc: 1, openJob: null, config: null, lib: null,
+  jobs: [], maxConc: 1, openJob: null, config: null, lib: null, duplicates: { path: "", results: [], selected: new Set(), scanned: false },
 };
 
 /* ---------------- lightbox ---------------- */
@@ -251,6 +251,99 @@ async function queueSelected() {
   switchTab("jobs");
 }
 
+/* ---------------- DUPLICATES tab ---------------- */
+const duplicatesUI = { root: h("div"), path: null, results: h("div"), summary: h("div") };
+
+function buildDuplicates() {
+  const d = state.duplicates;
+  duplicatesUI.path = h("input", { type: "text", class: "grow", placeholder: "/path/to/qBittorrent/downloads", value: d.path,
+    oninput: (e) => { d.path = e.target.value; } });
+  duplicatesUI.root.replaceChildren(
+    h("div", { class: "panel" },
+      h("h2", {}, "Find tracker duplicates"),
+      h("p", { class: "muted small" }, "Select a qBittorrent-style download directory. The scanner checks each immediate subfolder as one release and each top-level MKV/MP4 file individually; it does not descend into loose files or treat files inside folders separately."),
+      h("div", { class: "row" }, duplicatesUI.path,
+        h("button", { class: "btn", onclick: guard(openDirectoryPicker) }, "Browse"),
+        h("button", { class: "btn primary", onclick: guard(runDuplicateScan) }, "Scan tracker")),
+      h("div", { class: "muted small", style: "margin-top:8px" }, "A search error stops the scan. Items are only marked unmatched after a successful tracker response.")),
+    h("div", { class: "spacer" }), duplicatesUI.summary, duplicatesUI.results);
+  $("#tab-duplicates").replaceChildren(duplicatesUI.root);
+}
+
+async function openDirectoryPicker() {
+  const first = await api("GET", "/api/fs");
+  let current = dpath(state.duplicates.path) || first.path;
+  const root = first.root;
+  const overlay = h("div", { class: "picker-backdrop" });
+  const panel = h("div", { class: "picker panel" });
+  const location = h("div", { class: "muted small" });
+  const listing = h("div", { class: "picker-list" });
+  async function load(path) {
+    const data = await api("GET", "/api/fs?path=" + enc(path));
+    current = data.path;
+    location.textContent = current;
+    listing.replaceChildren(...data.entries.filter((e) => e.dir).map((e) => h("button", { class: "picker-entry", onclick: guard(() => load(e.path)) }, "📁 " + e.name)));
+    if (!listing.childNodes.length) listing.append(h("div", { class: "muted small" }, "No subfolders"));
+  }
+  panel.append(h("div", { class: "row" }, h("h2", { class: "grow" }, "Choose download directory"),
+    h("button", { class: "btn", onclick: () => overlay.remove() }, "Close")),
+    h("div", { class: "row" }, h("button", { class: "btn", onclick: guard(async () => { const data = await api("GET", "/api/fs?path=" + enc(current)); if (data.parent) await load(data.parent); }) }, "↑ Up"), location),
+    listing,
+    h("div", { class: "row" }, h("button", { class: "btn", onclick: () => load(root) }, "Go to allowed root"),
+      h("button", { class: "btn primary", onclick: () => { state.duplicates.path = current; duplicatesUI.path.value = current; overlay.remove(); } }, "Use this directory")));
+  overlay.append(panel); document.body.append(overlay);
+  await load(current);
+}
+function dpath(value) { return String(value || "").trim(); }
+
+async function runDuplicateScan() {
+  const path = dpath(state.duplicates.path);
+  if (!path) throw new Error("Choose a download directory first");
+  duplicatesUI.summary.textContent = "Scanning tracker…";
+  duplicatesUI.results.replaceChildren();
+  const result = await api("POST", "/api/duplicates/scan", { path });
+  const d = state.duplicates;
+  d.results = result.results; d.selected = new Set(result.results.filter((x) => x.status === "unmatched").map((x) => x.path)); d.scanned = true;
+  drawDuplicateResults(result);
+}
+
+function drawDuplicateResults(scan) {
+  const d = state.duplicates;
+  const unmatched = scan.results.filter((x) => x.status === "unmatched");
+  const matched = scan.results.filter((x) => x.status === "matched");
+  const skipped = scan.results.filter((x) => x.status === "skipped");
+  duplicatesUI.summary.replaceChildren(h("div", { class: "row" },
+    h("strong", {}, `Scanned ${scan.scanned} item(s)`),
+    h("span", { class: "muted small" }, `${matched.length} with tracker matches · ${unmatched.length} unmatched · ${skipped.length} skipped`)));
+  const unmatchedPanel = h("div", { class: "panel" },
+    h("div", { class: "row" }, h("h2", { class: "grow" }, `No tracker matches (${unmatched.length})`),
+      h("button", { class: "btn small", onclick: () => { d.selected = new Set(unmatched.map((x) => x.path)); drawDuplicateResults(scan); } }, "Select all"),
+      h("button", { class: "btn small", onclick: () => { d.selected.clear(); drawDuplicateResults(scan); } }, "Clear selection")),
+    unmatched.length ? h("div", { class: "dup-list" }, unmatched.map((item) => h("label", { class: "dup-item" },
+      h("input", { type: "checkbox", checked: d.selected.has(item.path), onchange: (e) => { e.target.checked ? d.selected.add(item.path) : d.selected.delete(item.path); drawDuplicateResults(scan); } }),
+      h("span", { class: "grow" }, h("strong", {}, item.name), h("span", { class: "muted small" }, `${item.kind} · search: ${item.query}`))))) : h("div", { class: "empty" }, "No unmatched items to add."),
+    h("div", { class: "row" }, h("span", { class: "muted small grow" }, `${d.selected.size} selected`),
+      h("button", { class: "btn primary", disabled: !d.selected.size, onclick: guard(async () => {
+        const r = await api("POST", "/api/jobs", { paths: [...d.selected], options: cfgDefaults() });
+        toast(`Queued ${r.created.length}` + (r.skipped.length ? `, skipped ${r.skipped.length} already active` : ""));
+        d.selected.clear(); switchTab("jobs");
+      }) }, `Add selected as batch (${d.selected.size})`)));
+  const matchedRows = matched.map((item) => {
+    const lines = item.matches.slice(0, 5).map((m) => {
+      const meta = [m.resolution, m.type, m.seeders == null ? "" : `${m.seeders} seeders`].filter(Boolean);
+      return h("span", { class: "match-line" }, m.name + (meta.length ? " · " + meta.join(" · ") : ""));
+    });
+    return h("div", { class: "dup-item matched" }, h("span", { class: "grow" },
+      h("strong", {}, item.name), h("span", { class: "muted small" }, `Search: ${item.query}`), ...lines));
+  });
+  const matchedPanel = h("div", { class: "panel" }, h("h2", {}, `Possible duplicates (${matched.length})`),
+    matched.length ? h("div", { class: "dup-list" }, matchedRows) : h("div", { class: "empty" }, "No tracker matches were found."));
+  const skippedPanel = skipped.length ? h("div", { class: "panel" }, h("h2", {}, `Skipped (${skipped.length})`),
+    h("p", { class: "muted small" }, "These folders contain no supported MKV/MP4 video, so they cannot be queued."),
+    ...skipped.map((item) => h("div", { class: "muted small" }, item.name))) : null;
+  duplicatesUI.results.replaceChildren(unmatchedPanel, h("div", { class: "spacer" }), matchedPanel, skippedPanel);
+}
+
 /* ---------------- JOBS tab ---------------- */
 const jobsUI = { list: h("div"), detail: h("div"), toolbar: h("div", { class: "row" }), logEl: null, logCount: 0, logJob: null, gallery: null, galleryDir: null, sig: "" };
 const STEPS = ["Frames", "Review", "Images", "Finalize", "Upload"];
@@ -392,23 +485,52 @@ const settingsLoad = guard(async () => {
   const c = state.config = await api("GET", "/api/config");
   const draft = { secrets: {} };
   const bool = (k, label) => h("label", { class: "chk" }, h("input", { type: "checkbox", checked: !!c[k], onchange: (e) => (draft[k] = e.target.checked) }), label);
+  const field = (k, label, type = "text", hint = "") => h("div", { class: "f" }, h("label", {}, label),
+    h("input", { type, value: c[k] ?? "", ...(type === "number" ? { min: k === "screenshot_start_seconds" ? 0 : 1, max: k === "screenshot_count" ? 200 : 86400, step: 1 } : {}),
+      oninput: (e) => { if (type === "number") { if (e.target.value !== "") draft[k] = Number(e.target.value); } else draft[k] = e.target.value; } }),
+    hint && h("div", { class: "muted small" }, hint));
   const secret = (k, label) => h("div", { class: "f" }, h("label", {}, label, " ", h("span", { class: "muted small" }, c.secrets[k] ? "(set – leave blank to keep)" : "(not set)")),
     h("input", { type: "password", autocomplete: "off", placeholder: c.secrets[k] ? "••••••••" : "", oninput: (e) => (draft.secrets[k] = e.target.value) }));
+  const client = c.download_client || { type: "", url: "", username: "", category: "", tags: "", save_path: "", download_dir: "", password_set: false };
+  const clientDraft = { ...client, password: "" };
+  const clientField = (k, label, placeholder = "") => h("div", { class: "f" }, h("label", {}, label), h("input", { type: k === "password" ? "password" : "text", autocomplete: "off", value: k === "password" ? "" : (clientDraft[k] || ""), placeholder: k === "password" && client.password_set ? "(set – leave blank to keep)" : placeholder,
+    oninput: (e) => (clientDraft[k] = e.target.value) }));
+  const clientType = h("select", { onchange: (e) => { clientDraft.type = e.target.value; } },
+    h("option", { value: "" }, "Disabled (download torrent to output folder)"), h("option", { value: "qbittorrent" }, "qBittorrent"), h("option", { value: "transmission" }, "Transmission"));
+  clientType.value = clientDraft.type || "";
+  const clientFields = h("div", { class: "subform" }, clientType,
+    clientField("url", "Web/API URL", "http://localhost:8080"), clientField("username", "Username"), clientField("password", "Password"),
+    clientField("category", "qBittorrent category (optional)"), clientField("tags", "qBittorrent tags (optional)"),
+    clientField("save_path", "qBittorrent save path (optional)"), clientField("download_dir", "Transmission download directory (optional)"));
+  const save = async () => {
+    if (clientDraft.type) draft.download_client = clientDraft;
+    else draft.download_client = null;
+    await api("PUT", "/api/config", draft); toast("Saved"); files.opts = null; settingsLoad();
+  };
   $("#tab-settings").replaceChildren(h("div", { class: "panel form" },
-    h("h2", {}, "Settings (config.json)"),
+    h("h2", {}, "Tracker and uploader settings"),
     secret("announce_url", "Announce URL"), secret("tmdb_api_key", "TMDB API key"), secret("tracker_api_token", "Tracker API token"), secret("upload_endpoint", "Upload endpoint"),
+    field("tracker_search_endpoint", "Tracker search endpoint (optional)", "text", "Leave blank to derive the UNIT3D /api/torrents/filter endpoint from the upload endpoint."),
     bool("confirm_before_upload", "Confirm before upload"), bool("anonymous_upload", "Anonymous upload"), bool("personal_release", "Personal release"), bool("stream_optimized", "Stream optimised"),
-    h("div", { class: "f" }, h("label", {}, "Group separator"), h("input", { type: "text", value: c.group_separator, oninput: (e) => (draft.group_separator = e.target.value) })),
-    h("div", { class: "muted small" }, "Secrets are never sent back to the browser. ‘Run as user’ from the CLI is not used by the web UI; jobs run as the user running the server."),
-    h("div", {}, h("button", { class: "btn primary", onclick: guard(async () => { await api("PUT", "/api/config", draft); toast("Saved"); files.opts = null; settingsLoad(); }) }, "Save"))));
+    field("group_separator", "Group separator"),
+    h("h2", {}, "Screenshot generation"),
+    field("screenshot_count", "Number of screenshots", "number", "Total screenshots generated per release. For TV packs, this is distributed across episodes."),
+    field("screenshot_start_seconds", "First screenshot time (seconds)", "number", "Used for single-video releases; e.g. 60 means 1:00."),
+    field("screenshot_interval_seconds", "Screenshot interval (seconds)", "number", "Used for single-video releases; e.g. 240 means every 4 minutes."),
+    h("h2", {}, "Download client"),
+    h("p", { class: "muted small" }, "After a successful tracker upload, send the returned torrent URL to a download client. Disable this to download the .torrent into the generated output folder."),
+    clientFields,
+    h("div", { class: "muted small" }, "Secrets are never sent back to the browser. Run-as-user is not used by the web UI; jobs run as the user running the server."),
+    h("div", {}, h("button", { class: "btn primary", onclick: guard(save) }, "Save settings"))));
 });
 
 /* ---------------- tabs / boot ---------------- */
 function switchTab(tab) {
   state.tab = tab;
   document.querySelectorAll("#tabs button").forEach((b) => b.classList.toggle("active", b.dataset.tab === tab));
-  for (const t of ["files", "jobs", "library", "settings"]) $("#tab-" + t).hidden = t !== tab;
+  for (const t of ["files", "jobs", "duplicates", "library", "settings"]) $("#tab-" + t).hidden = t !== tab;
   if (tab === "jobs") { drawJobsToolbar(); drawJobsList(); drawJobDetail(true); refreshJobs(); }
+  if (tab === "duplicates") buildDuplicates();
   if (tab === "library") libLoad();
   if (tab === "settings") settingsLoad();
 }
