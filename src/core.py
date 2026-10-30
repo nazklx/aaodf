@@ -8,9 +8,13 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from .models import Job
 
+from .config import (
+    FRAME_COUNT
+)
+
 VIDEO_EXTS = {".mkv", ".mp4"}
-FRAME_COUNT = 18
 FIRST_FRAME_AT = 60
+#FRAME_COUNT = 18
 FRAME_STEP = 240
 FRAME_WORKERS = 4
 

@@ -16,7 +16,8 @@ DEFAULT_CONFIG = {
     "personal_release": False,
     "stream_optimized": False,
     "group_separator": "-",
-    "run_as_user": ""
+    "run_as_user": "",
+    "frame_count": 18
 }
 
 TYPE_IDS = {
@@ -56,3 +57,4 @@ PERSONAL_RELEASE = config.get("personal_release", False)
 STREAM_OPTIMIZED = config.get("stream_optimized", False)
 GROUP_SEPARATOR = config.get("group_separator", "-")
 RUN_AS_USER = config.get("run_as_user", "").strip()
+FRAME_COUNT = config.get("frame_count", 18)

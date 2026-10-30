@@ -8,5 +8,6 @@
   "personal_release": false,
   "stream_optimized": false,
   "group_separator": "-",
-  "run_as_user": ""
+  "run_as_user": "",
+  "frame_count": 8
 }
