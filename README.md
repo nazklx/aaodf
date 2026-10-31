@@ -2,7 +2,7 @@
     ./run_web.sh [--host 127.0.0.1] [--port 8765] [--root /] [--jobs 1]
 
 Open the URL it prints out at first that includes the token.
-Traverse filesystem, add batch jobs, automatically grab keyframes at user-set intervals and allow you to review, Generate and send nfo file and raw mediainfo output, pull info from tmdb, automatically upload (with or without confirmation) generated torrent to tracker and send the tracker's torrent to your download client. Settings able to be changed within the webui.
+Traverse filesystem, add batch jobs, automatically grab keyframes at user-set intervals and allow you to review before uploading to host, Generate and send nfo file and raw mediainfo output, pull info from tmdb, automatically upload (with or without confirmation) generated torrent to tracker and send the tracker's torrent to your download client. Settings able to be changed within the webui.
 
 Notes:
 - Duplicate scanning does not work due to rate-limiting. 
