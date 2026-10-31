@@ -3,15 +3,16 @@ This is made for hosting on your seedbox/server that's already seeding torrents 
     ./run_web.sh [--host 127.0.0.1] [--port 8765] [--root /] [--jobs 1]
 
 Open the URL it prints out at first that includes the token.
+
+#### Description:
 Traverse filesystem, add batch jobs, automatically grab keyframes at user-set intervals and allow you to review before uploading to host, Generate and send nfo file and raw mediainfo output, pull info from tmdb, automatically upload (with or without confirmation) generated torrent to tracker and send the tracker's torrent to your download client. Settings able to be changed within the webui.
 
-Notes:
+#### Notes:
 - Duplicate scanning does not work due to rate-limiting. 
 - This is tailor-made for 0df, how I upload, and TV/MOVIES. 
 - Vibe coded as hell and for free so expect some bugs.
 
-Settings:
-
+#### Settings:
 - `tracker_search_endpoint` is optional. When blank, AAODF derives the UNIT3D `/api/torrents/filter` endpoint from `upload_endpoint`.
 - `screenshot_count`: total screenshots generated per release (default `18`).
 - `screenshot_start_seconds`: timestamp of the first screenshot for a single-video release (default `60`).
