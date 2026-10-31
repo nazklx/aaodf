@@ -1,3 +1,4 @@
+This is made for hosting on your seedbox/server that's already seeding torrents from other trackers, upload them as new torrents to 0df, and start cross-seeding.
 
     ./run_web.sh [--host 127.0.0.1] [--port 8765] [--root /] [--jobs 1]
 
