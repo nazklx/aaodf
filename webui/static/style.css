@@ -52,7 +52,11 @@ table.fs td.num { text-align: right; color: var(--muted); }
 .tray ul { list-style: none; margin: 0 0 10px; padding: 0; max-height: 220px; overflow: auto; }
 .tray li { display: flex; gap: 6px; align-items: center; padding: 3px 0; border-bottom: 1px solid var(--line); }
 .tray li span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; direction: rtl; text-align: left; }
-.tray .opts { display: grid; gap: 6px; margin: 10px 0; }
+.opts { display: grid; gap: 6px; margin: 10px 0; }
+.optfields { display: grid; gap: 8px; margin-top: 4px; }
+.optfields .f { display: grid; gap: 3px; }
+.optfields input[type=text], .optfields input[type=number] { width: 100%; }
+.optfields input:disabled { opacity: .5; cursor: not-allowed; }
 .insp { font-size: 12px; background: var(--bg); border-radius: 6px; padding: 6px 8px; margin: 4px 0; }
 
 /* jobs */
@@ -82,6 +86,13 @@ pre.log { background: #0f1217; color: #cfd6e4; padding: 10px; border-radius: 8px
 .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: 10px; margin-top: 10px; }
 .card { position: relative; border: 2px solid transparent; border-radius: 8px; overflow: hidden; background: var(--panel); outline: 1px solid var(--line); }
 .card.sel { border-color: var(--bad); }
+.card.sel.keep { border-color: var(--ok); }
+.grid.keeping .card:not(.sel) { opacity: .45; }
+.seg { display: inline-flex; }
+.seg .btn { border-radius: 0; }
+.seg .btn:first-child { border-radius: 6px 0 0 6px; }
+.seg .btn:last-child { border-radius: 0 6px 6px 0; margin-left: -1px; }
+button.btn.on { background: var(--sel); color: var(--accent); border-color: var(--accent); font-weight: 600; position: relative; }
 .card img { width: 100%; display: block; aspect-ratio: 16/9; object-fit: cover; cursor: zoom-in; background: #000; }
 .card .cap { padding: 4px 8px; font-size: 11px; color: var(--muted); display: flex; justify-content: space-between; gap: 6px; }
 .card input[type=checkbox] { position: absolute; top: 8px; left: 8px; width: 18px; height: 18px; cursor: pointer; }

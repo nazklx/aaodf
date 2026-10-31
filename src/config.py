@@ -18,6 +18,9 @@ DEFAULT_CONFIG = {
     "group_separator": "-",
     "run_as_user": "",
     "tracker_search_endpoint": "",
+    # Tracker search requests per minute (duplicate scans). Deliberately well under the
+    # ~60/min many UNIT3D trackers allow per API token, since pagination also counts.
+    "tracker_search_rate_limit": 30,
     "download_client": None,
     "screenshot_count": 18,
     "screenshot_start_seconds": 60,

@@ -6,6 +6,8 @@ import shlex
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 from pathlib import Path
 from urllib.parse import urlparse, urlsplit, urlunsplit
 import requests
@@ -210,7 +212,88 @@ def tracker_search_title(label: str) -> str:
     return query or label
 
 
-def search_tracker(title: str) -> list[dict]:
+class SearchCancelled(Exception):
+    """Raised inside search_tracker when the caller sets its cancel event."""
+
+
+DEFAULT_SEARCH_RATE = 30      # requests per minute
+MAX_SEARCH_ATTEMPTS = 5
+
+# One shared slot clock for every search in this process, so concurrent callers can't
+# add up to more than the configured rate. The rate is re-read from the config on every
+# request, so a change made in the web UI applies to a scan that is already running.
+_throttle_lock = threading.Lock()
+_next_request_at = 0.0
+
+
+def _search_interval() -> float:
+    raw = load_config().get("tracker_search_rate_limit", DEFAULT_SEARCH_RATE)
+    try:
+        rate = float(raw)
+        if rate != rate:  # NaN
+            raise ValueError
+    except (TypeError, ValueError):
+        rate = DEFAULT_SEARCH_RATE
+    return 60.0 / min(max(rate, 1.0), 600.0)
+
+
+def _sleep(seconds: float, cancel: threading.Event | None) -> None:
+    if cancel is not None:
+        if cancel.wait(seconds):
+            raise SearchCancelled()
+    else:
+        time.sleep(seconds)
+
+
+def _throttle(cancel: threading.Event | None = None) -> None:
+    """Block until this caller's request slot arrives (first request goes out immediately)."""
+    global _next_request_at
+    interval = _search_interval()
+    with _throttle_lock:
+        now = time.monotonic()
+        start = max(now, _next_request_at)
+        _next_request_at = start + interval
+    if start > now:
+        _sleep(start - now, cancel)
+
+
+def _back_off(seconds: float) -> None:
+    """Push the shared slot clock back (after a 429/5xx) so every caller waits."""
+    global _next_request_at
+    with _throttle_lock:
+        _next_request_at = max(_next_request_at, time.monotonic() + seconds)
+
+
+def _retry_after(response: requests.Response) -> float | None:
+    try:
+        return min(max(float(response.headers.get("Retry-After", "")), 1.0), 120.0)
+    except (TypeError, ValueError):
+        return None
+
+
+def _tracker_get(endpoint: str, headers: dict, params: dict,
+                 cancel: threading.Event | None = None) -> requests.Response:
+    """Rate-limited GET that backs off and retries on 429, 5xx and connection errors."""
+    last: Exception | None = None
+    for attempt in range(MAX_SEARCH_ATTEMPTS):
+        _throttle(cancel)
+        delay = min(5.0 * 2 ** attempt, 60.0)
+        try:
+            response = requests.get(endpoint, headers=headers, params=params, timeout=45)
+        except (requests.ConnectionError, requests.Timeout) as exc:
+            last = exc
+        else:
+            if response.status_code != 429 and response.status_code < 500:
+                response.raise_for_status()   # other 4xx (bad token...) are not retried
+                return response
+            last = requests.HTTPError(f"HTTP {response.status_code} from tracker search", response=response)
+            delay = _retry_after(response) or delay
+        if attempt + 1 < MAX_SEARCH_ATTEMPTS:
+            _back_off(delay)
+    raise last if last else RuntimeError("Tracker search failed")
+
+
+def search_tracker(title: str, cancel: threading.Event | None = None) -> list[dict]:
     current = load_config()
     token = str(current.get("tracker_api_token", "")).strip()
     if not token or token == "#":
@@ -222,9 +305,8 @@ def search_tracker(title: str) -> list[dict]:
     matches: list[dict] = []
     page = 1
     while page <= 20:
-        response = requests.get(endpoint, headers=headers,
-                                params={"name": title, "perPage": 100, "page": page}, timeout=45)
-        response.raise_for_status()
+        response = _tracker_get(endpoint, headers,
+                                {"name": title, "perPage": 100, "page": page}, cancel)
         body = response.json()
         if not isinstance(body, dict):
             raise ValueError("Tracker search returned an unexpected response format.")

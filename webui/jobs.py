@@ -33,6 +33,42 @@ M_PLAN_END = "1) Upload now"
 M_CONFIRM = "0) Cancel"
 
 JOB_OPTION_KEYS = ("anonymous_upload", "personal_release", "stream_optimized")
+BOOL_OPTIONS = ("review", "auto_upload") + JOB_OPTION_KEYS
+SCREENSHOT_RANGE = (1, 200)
+
+
+def clean_options(raw: dict) -> dict:
+    """Validate per-job options sent by the browser. Raises ValueError with a user-facing message.
+
+    screenshot_count: overrides the setting for this job only.
+    category / save_path: override the download client's qBittorrent category / save path
+    (Transmission: save_path becomes its download directory) for this job only.
+    """
+    out = {k: bool(raw[k]) for k in BOOL_OPTIONS if k in raw}
+    count = raw.get("screenshot_count")
+    if count not in (None, ""):
+        lo, hi = SCREENSHOT_RANGE
+        if isinstance(count, bool) or (isinstance(count, float) and not count.is_integer()):
+            raise ValueError("Screenshot count must be a whole number")
+        try:
+            n = int(count)
+        except (TypeError, ValueError, OverflowError):
+            raise ValueError("Screenshot count must be a whole number") from None
+        if not lo <= n <= hi:
+            raise ValueError(f"Screenshot count must be between {lo} and {hi}")
+        out["screenshot_count"] = n
+    for key, label in (("category", "Category"), ("save_path", "Target directory")):
+        value = raw.get(key)
+        if value in (None, ""):
+            continue
+        if not isinstance(value, str):
+            raise ValueError(f"{label} must be text")
+        value = value.strip()
+        if len(value) > 1024 or any(ord(c) < 32 for c in value):
+            raise ValueError(f"{label} is not valid")
+        if value:
+            out[key] = value
+    return out
 
 
 def inspect_target(target: Path) -> dict:
@@ -215,16 +251,34 @@ class JobManager:
             ids = [i for i in self.order if self.jobs[i].status not in ACTIVE]
         return sum(self.remove(i) for i in ids)
 
-    def proceed(self, job_id: str) -> str | None:
-        """Answer the review prompt (ENTER). Returns an error string or None."""
+    def proceed(self, job_id: str, keep: list[str] | None = None) -> str | None:
+        """Answer the review prompt (ENTER). Returns an error string or None.
+
+        With `keep` (a list of image file names) only those images are uploaded and every
+        other PNG in the job's folder is deleted first. Nothing is deleted unless the whole
+        list checks out, so a stale selection can't wipe the wrong images.
+        """
         with self.lock:
             job = self.jobs.get(job_id)
             if not job or job.status != "awaiting_review":
                 return "Job is not waiting for review"
             if job.regenerating:
                 return "Frames are still being regenerated"
-            if not any((OUTPUT / (job.out_dir or "")).glob("*.png")):
-                return "No images left - regenerate frames or cancel the job"
+            pngs = {p.name: p for p in (OUTPUT / (job.out_dir or "")).glob("*.png")}
+            if keep is None:
+                if not pngs:
+                    return "No images left - regenerate frames or cancel the job"
+            else:
+                wanted = set(keep)
+                if not wanted:
+                    return "Select at least one image to keep"
+                unknown = sorted(wanted - pngs.keys())
+                if unknown:
+                    return "These images no longer exist (the list changed): " + ", ".join(unknown[:3])
+                dropped = [p for n, p in pngs.items() if n not in wanted]
+                for p in dropped:
+                    p.unlink(missing_ok=True)
+                self._append(job_id, f"Keeping {len(wanted)} selected image(s), deleted {len(dropped)} other(s)")
             job.status, job.stage = "running", "hosting"
             self._write(job_id, "\n")
         self._save()
@@ -317,6 +371,23 @@ class JobManager:
         for k in JOB_OPTION_KEYS:
             if k in job.options:
                 cfg[k] = bool(job.options[k])
+        if "screenshot_count" in job.options:
+            cfg["screenshot_count"] = job.options["screenshot_count"]
+        category, save_path = job.options.get("category"), job.options.get("save_path")
+        if category or save_path:
+            client = cfg.get("download_client")
+            if isinstance(client, dict) and client:
+                client = dict(client)
+                if category:
+                    client["category"] = category
+                if save_path:
+                    transmission = str(client.get("type", "")).strip().lower() == "transmission"
+                    client["download_dir" if transmission else "save_path"] = save_path
+                cfg["download_client"] = client
+            else:
+                with self.lock:
+                    self._append(job.id, "Note: no download client is configured, so the category / target "
+                                         "directory for this job are ignored")
         # Without auto-upload the CLI shows its confirm prompt, which the UI answers.
         cfg["confirm_before_upload"] = not job.options.get("auto_upload", False)
         path = STATE_DIR / f"cfg-{job.id}.json"
@@ -465,9 +536,12 @@ class JobManager:
         job = self.jobs[jid]
         try:
             cmd = [sys.executable, "-m", "webui.regen", job.target, "--name", job.name or "", "--out", str(OUTPUT / (job.out_dir or ""))]
+            env = dict(os.environ, PYTHONUNBUFFERED="1")
+            job_cfg = STATE_DIR / f"cfg-{jid}.json"  # same per-job config the main run uses (screenshot count)
+            if job_cfg.exists():
+                env["AAODF_CONFIG"] = str(job_cfg)
             proc = subprocess.Popen(cmd, cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-                                    encoding="utf-8", errors="replace", stdin=subprocess.DEVNULL,
-                                    env=dict(os.environ, PYTHONUNBUFFERED="1"))
+                                    encoding="utf-8", errors="replace", stdin=subprocess.DEVNULL, env=env)
             for line in proc.stdout:
                 with self.lock:
                     self._append(jid, "[regen] " + line.rstrip())

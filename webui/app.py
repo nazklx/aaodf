@@ -13,15 +13,14 @@ from pathlib import Path
 
 from flask import Flask, Response, abort, jsonify, make_response, redirect, request, send_file, send_from_directory
 
-from .jobs import ACTIVE, OUTPUT, ROOT, STATE_DIR, JobManager, inspect_target
-from src.core import find_videos
-from src.tracker import search_tracker, tracker_search_title
+from .jobs import ACTIVE, OUTPUT, ROOT, STATE_DIR, JobManager, clean_options, inspect_target
+from .scanner import ScanBusy, ScanManager, ScanTooLarge
 
 VIDEO_EXTS = {".mkv", ".mp4"}
 SENSITIVE = ("announce_url", "tmdb_api_key", "tracker_api_token", "upload_endpoint")
 BOOL_KEYS = ("confirm_before_upload", "anonymous_upload", "personal_release", "stream_optimized")
 STR_KEYS = ("group_separator", "run_as_user", "tracker_search_endpoint")
-NUM_KEYS = ("screenshot_count", "screenshot_start_seconds", "screenshot_interval_seconds")
+NUM_KEYS = ("screenshot_count", "screenshot_start_seconds", "screenshot_interval_seconds", "tracker_search_rate_limit")
 MAX_ENTRIES = 5000
 COOKIE = "aaodf_token"
 
@@ -29,6 +28,7 @@ COOKIE = "aaodf_token"
 def create_app(fs_root: Path, token: str, max_concurrent: int = 1) -> Flask:
     app = Flask(__name__, static_folder=str(Path(__file__).parent / "static"), static_url_path="/static")
     manager = JobManager(max_concurrent)
+    scanner = ScanManager()
     fs_root = fs_root.resolve()
     OUTPUT.mkdir(exist_ok=True)
 
@@ -112,33 +112,24 @@ def create_app(fs_root: Path, token: str, max_concurrent: int = 1) -> Flask:
         directory = safe_path(raw_directory)
         if not directory.is_dir():
             abort(400, "Select a valid download directory")
+        try:
+            return jsonify(scan=scanner.start(directory))
+        except ScanBusy:
+            abort(409, "A scan is already running - wait for it or cancel it first")
+        except ScanTooLarge as exc:
+            abort(413, str(exc))
 
-        candidates = [p for p in directory.iterdir() if not p.name.startswith(".") and p.is_dir()]
-        candidates += [p for p in directory.iterdir() if p.is_file() and p.suffix.lower() in VIDEO_EXTS]
-        candidates.sort(key=lambda p: (not p.is_dir(), p.name.casefold()))
-        if len(candidates) > MAX_ENTRIES:
-            abort(413, f"Directory contains more than {MAX_ENTRIES} immediate entries")
-        results = []
-        for candidate in candidates:
-            query = tracker_search_title(candidate.name)
-            try:
-                matches = search_tracker(query)
-            except Exception as exc:
-                app.logger.warning("Duplicate scan failed for %s: %s", candidate, exc)
-                abort(502, f"Tracker search failed for {candidate.name}: {exc}. No batch was created.")
+    @app.get("/api/duplicates/scan")
+    def duplicate_scan_status():
+        try:
+            since = int(request.args.get("since", 0))
+        except ValueError:
+            since = 0
+        return jsonify(scan=scanner.snapshot(request.args.get("id", ""), since))
 
-            eligible = not candidate.is_dir() or bool(find_videos(candidate))
-            results.append({
-                "path": str(candidate),
-                "name": candidate.name,
-                "kind": "folder" if candidate.is_dir() else "file",
-                "query": query,
-                "matches": matches[:10],
-                "match_count": len(matches),
-                "eligible": eligible,
-                "status": "matched" if matches else ("unmatched" if eligible else "skipped"),
-            })
-        return jsonify(path=str(directory), scanned=len(candidates), results=results)
+    @app.post("/api/duplicates/scan/cancel")
+    def duplicate_scan_cancel():
+        return jsonify(ok=scanner.cancel())
 
     # ---------- jobs ----------
     @app.get("/api/jobs")
@@ -152,7 +143,12 @@ def create_app(fs_root: Path, token: str, max_concurrent: int = 1) -> Flask:
         if not paths:
             abort(400, "No paths given")
         opts = body.get("options", {})
-        clean = {k: bool(opts[k]) for k in ("review", "auto_upload", "anonymous_upload", "personal_release", "stream_optimized") if k in opts}
+        if not isinstance(opts, dict):
+            abort(400, "options must be an object")
+        try:
+            clean = clean_options(opts)
+        except ValueError as exc:
+            abort(400, str(exc))
         created, skipped = manager.add(paths, clean)
         return jsonify(created=created, skipped=skipped)
 
@@ -176,7 +172,13 @@ def create_app(fs_root: Path, token: str, max_concurrent: int = 1) -> Flask:
 
     @app.post("/api/jobs/<jid>/proceed")
     def job_proceed(jid):
-        return action(manager.proceed, jid)
+        keep = (request.get_json(silent=True) or {}).get("keep")
+        if keep is not None:
+            if (not isinstance(keep, list) or len(keep) > MAX_ENTRIES
+                    or not all(isinstance(n, str) and n.lower().endswith(".png") and "/" not in n and "\\" not in n
+                               for n in keep)):
+                abort(400, "keep must be a list of image file names")
+        return action(manager.proceed, jid, keep)
 
     @app.post("/api/jobs/<jid>/confirm")
     def job_confirm(jid):
@@ -334,6 +336,7 @@ def create_app(fs_root: Path, token: str, max_concurrent: int = 1) -> Flask:
             "screenshot_count": (1, 200),
             "screenshot_start_seconds": (0, 86400),
             "screenshot_interval_seconds": (1, 86400),
+            "tracker_search_rate_limit": (1, 600),
         }
         for k, (minimum, maximum) in limits.items():
             if k in body:
