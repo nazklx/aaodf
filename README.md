@@ -18,6 +18,7 @@ Traverse filesystem, add batch jobs, automatically grab keyframes at user-set in
 - `screenshot_interval_seconds`: spacing between screenshots for a single-video release (default `240`).
 - For multi-episode releases, `screenshot_count` is distributed across the usable episodes; timestamps are sampled within each episode.
 - `download_client` may be `null` (download the returned torrent URL into the generated output folder), or an object with `type` (`qbittorrent` or `transmission`), `url`, optional `username`/`password`, and client-specific options. qBittorrent supports `category`, `tags`, and `save_path`; Transmission supports `download_dir`.
+- Promotion flags, sent with every upload: `free` (freeleech percentage, `0` = off, `1`-`100`), `free_days` (how long the freeleech lasts, `0` = never expires), `doubleup` (`true`/`false`), `doubleup_days` (`0` = never expires) and `featured` (`true`/`false`, sends both the tracker's `featured` and `sticky` flags). They are set in `config.json` as defaults, can be changed per job in the web UI's Files/Duplicates options, and can be edited again in the pre-upload check. The tracker ignores them unless your account is allowed to set them.
 - `tracker_search_rate_limit`: tracker search requests per minute used by duplicate scans (default `30`; each page of results counts as one request).
 
 #### Example config.json
@@ -31,6 +32,11 @@ Traverse filesystem, add batch jobs, automatically grab keyframes at user-set in
     "anonymous_upload": false,
     "personal_release": false,
     "stream_optimized": false,
+    "free": 0,
+    "free_days": 0,
+    "doubleup": false,
+    "doubleup_days": 0,
+    "featured": false,
     "group_separator": "-",
     "run_as_user": "qbittorrent",
     "tracker_search_endpoint": "",

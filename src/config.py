@@ -15,6 +15,12 @@ DEFAULT_CONFIG = {
     "anonymous_upload": False,
     "personal_release": False,
     "stream_optimized": False,
+    # Promotion flags sent with every upload (the tracker ignores them unless your account may set them).
+    "free": 0,              # freeleech percentage: 0 = off, 1-100 = that % free
+    "free_days": 0,         # days the freeleech lasts, 0 = never expires
+    "doubleup": False,      # double upload
+    "doubleup_days": 0,     # days double upload lasts, 0 = never expires
+    "featured": False,      # featured / sticky
     "group_separator": "-",
     "run_as_user": "",
     "tracker_search_endpoint": "",

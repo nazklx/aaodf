@@ -1,5 +1,6 @@
 from __future__ import annotations
 import contextlib
+import json
 import os
 import re
 import shlex
@@ -32,6 +33,22 @@ TYPE_LABELS = {"disc": "Full Disc", "remux": "Remux", "encode": "Encode",
                "webdl": "WEB-DL", "webrip": "WEBRip", "hdtv": "HDTV"}
 SD_RESOLUTIONS = {"576p", "576i", "480p", "480i"}
 _FORBIDDEN_RE = re.compile(r'[<>:"/\\|?*]')
+
+# Every category id get_category_id() can return, with a label for the pre-upload editor.
+CATEGORY_CHOICES = [
+    (9, "Movie · SD"), (10, "Movie · 2160p"), (11, "Movie · BluRay"), (12, "Movie · Remux / Full Disc"),
+    (14, "Movie · DVD"), (17, "Movie · Pack"), (18, "Movie · x264"), (19, "Movie · x265"),
+    (20, "Movie · XviD"), (58, "Movie · WEB"), 
+    (43, "Anime"), (61, "Anime · Packs"), (62, "Anime · Movies"),
+    (21, "TV · SD"), (22, "TV · 2160p"), (23, "TV · BluRay"), (25, "TV · DVD"), (28, "TV · Pack"),
+    (30, "TV · x264"), (31, "TV · x265"), (32, "TV · XviD"), (59, "TV · WEB"),
+]
+
+# Promotion fields. `free` is a percentage (0 = off); the *_days values are how long it lasts
+# (0 = forever). They live in Plan.fields under these names and are translated to the tracker's
+# own field names (fl_until, du_until, ...) by tracker_payload().
+PROMO_KEYS = ("free", "free_days", "doubleup", "doubleup_days", "featured")
+MAX_PROMO_DAYS = 3650
 
 def clean_title(name: str) -> str:
     return re.sub(r"\s+", " ", _FORBIDDEN_RE.sub("", name)).strip()[:255]
@@ -106,6 +123,47 @@ def get_category_id(is_tv: bool, multi: bool, tags: dict) -> int:
             return 58
         return 18
 
+def _config_int(key: str, lo: int, hi: int) -> int:
+    value = config.get(key, 0)
+    if isinstance(value, bool):
+        return 0
+    try:
+        number = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return 0
+    return number if lo <= number <= hi else 0
+
+def promo_defaults() -> dict:
+    """Free / double upload / featured as configured (per-job overrides arrive via AAODF_CONFIG)."""
+    free = _config_int("free", 0, 100)
+    doubleup = int(bool(config.get("doubleup", False)))
+    return {
+        "free": free,
+        "free_days": _config_int("free_days", 0, MAX_PROMO_DAYS) if free else 0,
+        "doubleup": doubleup,
+        "doubleup_days": _config_int("doubleup_days", 0, MAX_PROMO_DAYS) if doubleup else 0,
+        "featured": int(bool(config.get("featured", False))),
+    }
+
+def tracker_payload(fields: dict) -> dict:
+    """Turn Plan.fields into the form data the tracker's upload API expects."""
+    data = {k: v for k, v in fields.items() if k not in PROMO_KEYS and v is not None}
+    for key in ("imdb", "tvdb"):          # optional ids: leave them out instead of sending 0
+        if not data.get(key):
+            data.pop(key, None)
+    if fields.get("free"):
+        data["free"] = int(fields["free"])
+        if fields.get("free_days"):
+            data["fl_until"] = int(fields["free_days"])
+    if fields.get("doubleup"):
+        data["doubleup"] = 1
+        if fields.get("doubleup_days"):
+            data["du_until"] = int(fields["doubleup_days"])
+    if fields.get("featured"):
+        data["featured"] = 1
+        data["sticky"] = 1
+    return data
+
 def compute_plan(job: Job, mediainfo_text: str) -> Plan | None:
     from .tmdb import parse_release
     if not TRACKER_API_TOKEN.strip():
@@ -149,6 +207,7 @@ def compute_plan(job: Job, mediainfo_text: str) -> Plan | None:
         "personal_release": int(PERSONAL_RELEASE),
         "stream": int(STREAM_OPTIMIZED),
         "sd": int(resolution in SD_RESOLUTIONS),
+        **promo_defaults(),
     }
     if info.imdb_id:
         fields["imdb"] = info.imdb_id
@@ -172,12 +231,131 @@ def _label_for(mapping: dict, value: int, labels: dict | None = None) -> str:
     key = next((k for k, v in mapping.items() if v == value), None)
     return (labels or {}).get(key, key) if key else "?"
 
+_FORM_KEYS = ("name", "description", "category_id", "type_id", "resolution_id", "tmdb",
+              "anonymous", "personal_release", "stream", "sd")
+# Marker line the web UI looks for; the JSON after it describes the editable form.
+PLAN_FIELDS_MARKER = "PLAN_FIELDS "
+
+def plan_form(plan: Plan) -> dict:
+    """The fields the web UI may edit before upload (mediainfo is deliberately left out)."""
+    f = plan.fields
+    form = {k: f[k] for k in _FORM_KEYS + PROMO_KEYS}
+    form["imdb"] = f.get("imdb", 0)
+    form["tvdb"] = f.get("tvdb", 0)
+    if plan.tv:
+        form["season_number"] = f["season_number"]
+        form["episode_number"] = f["episode_number"]
+    return form
+
+def plan_choices() -> dict:
+    return {
+        "types": [[TYPE_IDS[k], TYPE_LABELS[k]] for k in TYPE_IDS],
+        "resolutions": [[v, k] for k, v in RESOLUTION_IDS.items()],
+        "categories": [[i, label] for i, label in CATEGORY_CHOICES],
+    }
+
+def _whole(value: object, lo: int, hi: int) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, float) and value.is_integer():
+        value = int(value)
+    if isinstance(value, int) and lo <= value <= hi:
+        return value
+    return None
+
+_ID_EDITS = {  # key -> (label, min, max)
+    "category_id": ("Category", 1, 9999), "tmdb": ("TMDB id", 1, 99999999),
+    "imdb": ("IMDb id", 0, 99999999), "tvdb": ("TVDB id", 0, 99999999),
+    "season_number": ("Season", 0, 9999), "episode_number": ("Episode", 0, 99999),
+    "free": ("Free percentage", 0, 100), "free_days": ("Free days", 0, MAX_PROMO_DAYS),
+    "doubleup_days": ("Double upload days", 0, MAX_PROMO_DAYS),
+}
+_FLAG_EDITS = {"anonymous": "Anonymous", "personal_release": "Personal release", "stream": "Stream optimised",
+               "sd": "SD", "doubleup": "Double upload", "featured": "Featured"}
+
+def apply_edits(plan: Plan, raw: str) -> list[str]:
+    """Apply one JSON object of field edits from the web UI.
+
+    Returns a list of problems. The plan is only changed when that list is empty, so a bad
+    value can never half-apply."""
+    try:
+        edits = json.loads(raw)
+    except ValueError:
+        return ["the edits were not valid JSON"]
+    if not isinstance(edits, dict):
+        return ["the edits must be a JSON object"]
+
+    errors: list[str] = []
+    staged: dict = {}
+    for key, value in edits.items():
+        if key == "name":
+            text = value.strip() if isinstance(value, str) else ""
+            if not text or len(text) > 255:
+                errors.append("Name must be 1-255 characters")
+            elif _FORBIDDEN_RE.search(text):
+                errors.append('Name cannot contain < > : " / \\ | ? *')
+            else:
+                staged[key] = text
+        elif key == "description":
+            if not isinstance(value, str) or len(value) > 200_000:
+                errors.append("Description must be text")
+            else:
+                staged[key] = value.strip() or plan.fields["name"]
+        elif key == "type_id":
+            if _whole(value, 0, 10**6) not in TYPE_IDS.values():
+                errors.append("Type is not one of the known types")
+            else:
+                staged[key] = int(value)
+        elif key == "resolution_id":
+            if _whole(value, 0, 10**6) not in RESOLUTION_IDS.values():
+                errors.append("Resolution is not one of the known resolutions")
+            else:
+                staged[key] = int(value)
+        elif key in _ID_EDITS:
+            label, lo, hi = _ID_EDITS[key]
+            if key in ("season_number", "episode_number") and not plan.tv:
+                errors.append(f"{label} only applies to TV releases")
+            elif (number := _whole(value, lo, hi)) is None:
+                errors.append(f"{label} must be a whole number from {lo} to {hi}")
+            else:
+                staged[key] = number
+        elif key in _FLAG_EDITS:
+            if isinstance(value, bool) or value in (0, 1):
+                staged[key] = int(bool(value))
+            else:
+                errors.append(f"{_FLAG_EDITS[key]} must be on or off")
+        else:
+            errors.append(f"Unknown field: {key}")
+    if errors:
+        return errors
+
+    plan.fields.update(staged)
+    plan.edited.update(staged)
+    if not plan.fields.get("free"):
+        plan.fields["free_days"] = 0
+    if not plan.fields.get("doubleup"):
+        plan.fields["doubleup_days"] = 0
+    return []
+
+def _days_text(days: int) -> str:
+    return f"{days} day{'s' if days != 1 else ''}" if days else "no expiry"
+
 def print_plan(plan: Plan) -> None:
     f = plan.fields
     note = ""
     if not plan.type_known and "type_id" not in plan.edited:
         note = "  <- source not recognised, assumed Encode; check!"
     desc = f["description"]
+    if not sys.stdin.isatty():      # only the web UI reads this line
+        print(PLAN_FIELDS_MARKER + json.dumps(
+            {"fields": plan_form(plan), "choices": plan_choices(), "is_tv": plan.is_tv}), flush=True)
+    ids = [f"TMDB {f['tmdb']}"]
+    if f.get("imdb"):
+        ids.append(f"IMDb {f['imdb']}")
+    if f.get("tvdb"):
+        ids.append(f"TVDB {f['tvdb']}")
+    flags = [label for key, label in (("anonymous", "anonymous"), ("personal_release", "personal release"),
+                                      ("stream", "stream optimised"), ("sd", "SD")) if f.get(key)]
     print()
     print("Upload details:")
     print(f"  Name:         {f['name']}")
@@ -185,6 +363,13 @@ def print_plan(plan: Plan) -> None:
     print(f"  Type:         {_label_for(TYPE_IDS, f['type_id'], TYPE_LABELS)} (id {f['type_id']}){note}")
     print(f"  Resolution:   {_label_for(RESOLUTION_IDS, f['resolution_id'])} (id {f['resolution_id']})")
     print(f"  TMDB match:   {plan.info.label}")
+    print(f"  IDs:          {', '.join(ids)}")
+    if plan.tv:
+        print(f"  Season/Ep:    {f['season_number']} / {f['episode_number']}")
+    print(f"  Flags:        {', '.join(flags) or 'none'}")
+    print(f"  Free:         {str(f['free']) + '% for ' + _days_text(f['free_days']) if f['free'] else 'no'}")
+    print(f"  Double up:    {_days_text(f['doubleup_days']) if f['doubleup'] else 'no'}")
+    print(f"  Featured:     {'yes (sticky)' if f['featured'] else 'no'}")
     print(f"  Description:  {len(desc)} characters, {desc.count('[img]')} image link(s)")
 
 def _tracker_search_url() -> str:
@@ -462,7 +647,7 @@ def post_upload(fields: dict, torrent_path: Path, nfo_path: Path) -> tuple[bool,
     try:
         with torrent_path.open("rb") as tf, nfo_path.open("rb") as nf:
             r = requests.post(
-                UPLOAD_ENDPOINT, headers=headers, data=fields,
+                UPLOAD_ENDPOINT, headers=headers, data=tracker_payload(fields),
                 files={"torrent": (torrent_path.name, tf, "application/x-bittorrent"),
                        "nfo": (nfo_path.name, nf, "text/plain")},
                 timeout=300,
@@ -616,10 +801,19 @@ def upload_release(job: Job, mediainfo_text: str, extract_frames_func=None) -> b
         uploaded, download_url = post_upload(plan.fields, job.torrent_path, job.nfo_path)
         return deliver_torrent(download_url, job.torrent_path) if uploaded else False
 
+    # The web UI (stdin is a pipe) can send "u" followed by one line of JSON edits: apply them,
+    # then upload. Invalid edits change nothing and the prompt is shown again.
+    from_web = not sys.stdin.isatty()
     while True:
         print_plan(plan)
         print("\n  1) Upload now\n  0) Cancel")
-        key = read_key("01")
+        key = read_key("01u" if from_web else "01")
+        if key == "u":
+            errors = apply_edits(plan, sys.stdin.readline())
+            if errors:
+                print("Invalid edit: " + "; ".join(errors))
+                continue
+            key = "1"
         if key == "1":
             uploaded, download_url = post_upload(plan.fields, job.torrent_path, job.nfo_path)
             if uploaded:

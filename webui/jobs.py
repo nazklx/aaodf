@@ -31,32 +31,71 @@ M_REVIEW = "Press ENTER to continue"
 M_PLAN_START = "Upload details:"
 M_PLAN_END = "1) Upload now"
 M_CONFIRM = "0) Cancel"
+M_FIELDS = "PLAN_FIELDS "       # JSON describing the editable upload form (see src/tracker.py)
+M_BAD_EDIT = "Invalid edit:"
 
-JOB_OPTION_KEYS = ("anonymous_upload", "personal_release", "stream_optimized")
+# doubleup / featured are on/off per-job options like the others; free is a percentage and the
+# *_days values say how long a promotion lasts (0 = never expires).
+JOB_OPTION_KEYS = ("anonymous_upload", "personal_release", "stream_optimized", "doubleup", "featured")
 BOOL_OPTIONS = ("review", "auto_upload") + JOB_OPTION_KEYS
 SCREENSHOT_RANGE = (1, 200)
+PROMO_INT_OPTIONS = {
+    "free": ("Free percentage", 0, 100),
+    "free_days": ("Free days", 0, 3650),
+    "doubleup_days": ("Double upload days", 0, 3650),
+}
+# Fields the pre-upload editor may change; src/tracker.py apply_edits() validates the values.
+PLAN_EDIT_KEYS = (
+    "name", "description", "category_id", "type_id", "resolution_id", "tmdb", "imdb", "tvdb",
+    "season_number", "episode_number", "anonymous", "personal_release", "stream", "sd",
+    "free", "free_days", "doubleup", "doubleup_days", "featured",
+)
+
+
+def _whole_number(value: object, label: str, lo: int, hi: int) -> int:
+    if isinstance(value, bool) or (isinstance(value, float) and not value.is_integer()):
+        raise ValueError(f"{label} must be a whole number")
+    try:
+        n = int(value)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError(f"{label} must be a whole number") from None
+    if not lo <= n <= hi:
+        raise ValueError(f"{label} must be between {lo} and {hi}")
+    return n
+
+
+def clean_plan_edits(raw: object) -> dict:
+    """Validate the edits sent from the pre-upload form. Raises ValueError with a user-facing message."""
+    if not isinstance(raw, dict):
+        raise ValueError("fields must be an object")
+    out = {}
+    for key, value in raw.items():
+        if key not in PLAN_EDIT_KEYS:
+            raise ValueError(f"Unknown field: {key}")
+        if isinstance(value, float) and not value.is_integer():
+            raise ValueError(f"{key} must be a whole number")
+        if not isinstance(value, (str, int, float)):
+            raise ValueError(f"{key} has an invalid value")
+        out[key] = int(value) if isinstance(value, float) else value
+    return out
 
 
 def clean_options(raw: dict) -> dict:
     """Validate per-job options sent by the browser. Raises ValueError with a user-facing message.
 
     screenshot_count: overrides the setting for this job only.
+    free / free_days / doubleup / doubleup_days / featured: promotion flags for this job's upload.
     category / save_path: override the download client's qBittorrent category / save path
     (Transmission: save_path becomes its download directory) for this job only.
     """
     out = {k: bool(raw[k]) for k in BOOL_OPTIONS if k in raw}
     count = raw.get("screenshot_count")
     if count not in (None, ""):
-        lo, hi = SCREENSHOT_RANGE
-        if isinstance(count, bool) or (isinstance(count, float) and not count.is_integer()):
-            raise ValueError("Screenshot count must be a whole number")
-        try:
-            n = int(count)
-        except (TypeError, ValueError, OverflowError):
-            raise ValueError("Screenshot count must be a whole number") from None
-        if not lo <= n <= hi:
-            raise ValueError(f"Screenshot count must be between {lo} and {hi}")
-        out["screenshot_count"] = n
+        out["screenshot_count"] = _whole_number(count, "Screenshot count", *SCREENSHOT_RANGE)
+    for key, (label, lo, hi) in PROMO_INT_OPTIONS.items():
+        value = raw.get(key)
+        if value not in (None, ""):
+            out[key] = _whole_number(value, label, lo, hi)
     for key, label in (("category", "Category"), ("save_path", "Target directory")):
         value = raw.get(key)
         if value in (None, ""):
@@ -115,6 +154,7 @@ class Job:
     uploaded: bool = False
     error: str | None = None
     plan: list = field(default_factory=list)
+    plan_fields: dict = field(default_factory=dict)   # editable upload form, only while awaiting confirmation
     frames_total: int = 0
     frames_done: int = 0
     hosted: int = 0
@@ -284,17 +324,24 @@ class JobManager:
         self._save()
         return None
 
-    def confirm(self, job_id: str, go: bool) -> str | None:
+    def confirm(self, job_id: str, go: bool, fields: dict | None = None) -> str | None:
+        """Answer the confirm prompt. `fields` are edits to the upload form; the CLI validates them
+        and, if any are invalid, changes nothing and asks again (the UI sees that as a new prompt)."""
         with self.lock:
             job = self.jobs.get(job_id)
             if not job or job.status != "awaiting_confirm":
                 return "Job is not waiting for upload confirmation"
             if go:
                 job.status, job.stage, job.error = "running", "uploading", None
+                if fields:
+                    self._append(job_id, "Applying edits: " + ", ".join(sorted(fields)))
+                    self._write(job_id, "u\n" + json.dumps(fields) + "\n")
+                else:
+                    self._write(job_id, "1\n")
             else:
                 self.declined.add(job_id)
                 job.status, job.stage = "running", "finalize"
-            self._write(job_id, "1\n" if go else "0\n")
+                self._write(job_id, "0\n")
         self._save()
         return None
 
@@ -345,6 +392,7 @@ class JobManager:
     def _finish(self, job: Job, status: str, error: str | None = None) -> None:
         job.status, job.finished = status, time.time()
         job.stage = status
+        job.plan_fields = {}
         if status in ("finished",) and job.uploaded:
             job.percent = 100
         if error:
@@ -371,8 +419,9 @@ class JobManager:
         for k in JOB_OPTION_KEYS:
             if k in job.options:
                 cfg[k] = bool(job.options[k])
-        if "screenshot_count" in job.options:
-            cfg["screenshot_count"] = job.options["screenshot_count"]
+        for k in ("screenshot_count", *PROMO_INT_OPTIONS):
+            if k in job.options:
+                cfg[k] = job.options[k]
         category, save_path = job.options.get("category"), job.options.get("save_path")
         if category or save_path:
             client = cfg.get("download_client")
@@ -467,7 +516,13 @@ class JobManager:
         s = line.strip()
         changed = False
 
-        if m := re.match(r"Extracting (\d+) ", s):
+        if s.startswith(M_FIELDS):
+            try:
+                parsed = json.loads(s[len(M_FIELDS):])
+            except ValueError:
+                parsed = None
+            job.plan_fields = parsed if isinstance(parsed, dict) else {}
+        elif m := re.match(r"Extracting (\d+) ", s):
             job.stage, job.frames_total, job.frames_done = "frames", int(m.group(1)), 0
             changed = True
         elif re.match(r"Frame\s+\d+/\d+ .*: (done|FAILED)$", s):
@@ -512,7 +567,7 @@ class JobManager:
             job.error = None
         elif s.startswith("Link:"):
             job.link = s.split(":", 1)[1].strip()
-        elif s.startswith(("Upload failed", "Response:")):
+        elif s.startswith(("Upload failed", "Response:", M_BAD_EDIT)):
             job.error = s[:300]
         elif s.endswith("skipping tracker upload.") or s.startswith("Error:"):
             job.error = s[:300]

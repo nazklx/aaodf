@@ -62,6 +62,11 @@ table.fs td.num { text-align: right; color: var(--muted); }
 /* jobs */
 .jobs-layout { display: grid; grid-template-columns: 420px 1fr; gap: 14px; align-items: start; }
 @media (max-width: 1000px) { .jobs-layout { grid-template-columns: 1fr; } }
+/* The open job follows you down the list: it sticks just under the sticky header and scrolls on its own
+   when it is taller than the window. --header-h is kept up to date by app.js. */
+@media (min-width: 1001px) {
+  .jobs-detail { position: sticky; top: calc(var(--header-h, 56px) + 12px); max-height: calc(100vh - var(--header-h, 56px) - 24px); overflow-y: auto; }
+}
 .job { border: 1px solid var(--line); border-radius: 8px; padding: 10px; margin-bottom: 8px; background: var(--panel); cursor: pointer; }
 .job.open { border-color: var(--accent); }
 .job .title { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -123,3 +128,16 @@ button.btn.on { background: var(--sel); color: var(--accent); border-color: var(
 .picker-entry:hover { background: var(--sel); }
 .subform { display: grid; gap: 8px; padding: 10px; border: 1px solid var(--line); border-radius: 8px; }
 .subform select { background: var(--bg); color: var(--text); border: 1px solid var(--line); border-radius: 6px; padding: 7px 9px; font: inherit; }
+
+/* free / double upload / featured controls */
+.promo { display: grid; gap: 6px; }
+.promo .line { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+.promo input:disabled { opacity: .5; cursor: not-allowed; }
+
+/* pre-upload editor */
+.editform { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 10px 12px; margin: 10px 0; }
+.editform .f { display: grid; gap: 3px; align-content: start; min-width: 0; }
+.editform .wide { grid-column: 1 / -1; }
+.editform .f input[type=text], .editform .f input[type=number], .editform .f select, .editform .f textarea { width: 100%; }
+.editform select, .editform textarea { background: var(--bg); color: var(--text); border: 1px solid var(--line); border-radius: 6px; padding: 6px 9px; font: inherit; }
+.editform textarea { font: 12px/1.4 ui-monospace, monospace; resize: vertical; }

@@ -172,8 +172,48 @@ function cfgDefaults() {
   return {
     review: true, auto_upload: c.confirm_before_upload === false, anonymous_upload: !!c.anonymous_upload,
     personal_release: !!c.personal_release, stream_optimized: !!c.stream_optimized,
+    free: Number(c.free) || 0, free_days: Number(c.free_days) || 0,
+    doubleup: c.doubleup ? 1 : 0, doubleup_days: Number(c.doubleup_days) || 0, featured: c.featured ? 1 : 0,
     screenshot_count: "", category: "", save_path: "",
   };
+}
+
+/* Free / double upload / featured controls, shared by the options panel and the pre-upload editor.
+ * `m` is edited in place: free (0 = off, otherwise 1-100 %), free_days, doubleup (0/1),
+ * doubleup_days (0 = never expires) and featured (0/1). */
+function promoControls(m) {
+  const box = (checked, onchange) => h("input", { type: "checkbox", checked: !!checked, onchange });
+  const num = (value, min, max, oninput) => h("input", { type: "number", min, max, step: 1, value: value || "", oninput });
+  const freeOn = box(m.free > 0, () => apply());
+  const freePct = num(m.free > 0 ? m.free : 100, 1, 100, () => apply());
+  const freeDays = num(m.free_days, 1, 3650, () => apply());
+  const dblOn = box(m.doubleup, () => apply());
+  const dblDays = num(m.doubleup_days, 1, 3650, () => apply());
+  const featOn = box(m.featured, () => apply());
+  const days = (el) => (el.value === "" ? 0 : Number(el.value));
+  function apply() {
+    m.free = freeOn.checked ? (freePct.value === "" ? NaN : Number(freePct.value)) : 0;
+    m.free_days = freeOn.checked ? days(freeDays) : 0;
+    m.doubleup = dblOn.checked ? 1 : 0;
+    m.doubleup_days = dblOn.checked ? days(dblDays) : 0;
+    m.featured = featOn.checked ? 1 : 0;
+    freePct.disabled = freeDays.disabled = !freeOn.checked;
+    dblDays.disabled = !dblOn.checked;
+  }
+  apply();
+  return h("div", { class: "promo" },
+    h("div", { class: "line" }, h("label", { class: "chk" }, freeOn, "Free"), freePct, "% for", freeDays, "days"),
+    h("div", { class: "line" }, h("label", { class: "chk" }, dblOn, "Double upload"), "for", dblDays, "days"),
+    h("div", { class: "line" }, h("label", { class: "chk" }, featOn, "Featured (sticky)")),
+    h("div", { class: "muted small" }, "Leave days blank for no expiry. The tracker ignores these unless your account is allowed to set them."));
+}
+
+// Throws a user-facing Error when the promotion values are out of range.
+function checkPromo(m) {
+  const whole = (v, lo, hi) => Number.isInteger(v) && v >= lo && v <= hi;
+  if (m.free !== 0 && !whole(m.free, 1, 100)) throw new Error("Free percentage must be a whole number from 1 to 100");
+  if (!whole(m.free_days, 0, 3650)) throw new Error("Free days must be a whole number from 0 to 3650");
+  if (!whole(m.doubleup_days, 0, 3650)) throw new Error("Double upload days must be a whole number from 0 to 3650");
 }
 
 // Blank screenshot count / category / target directory mean "use the Settings value".
@@ -195,6 +235,7 @@ function optionsPanel(o) {
     chk("review", "Pause to review images before they are hosted", "Matches the CLI's ‘delete unwanted images’ pause"),
     chk("auto_upload", "Upload to tracker without asking", "Skips the final confirmation"),
     chk("anonymous_upload", "Anonymous upload"), chk("personal_release", "Personal release"), chk("stream_optimized", "Stream optimised"),
+    promoControls(o),
     note,
     h("div", { class: "optfields" },
       field("screenshot_count", "Screenshots per job", `${c.screenshot_count ?? 18} (from Settings)`, null, "number"),
@@ -204,7 +245,11 @@ function optionsPanel(o) {
 }
 
 function jobPayload(o) {
-  const p = { review: o.review, auto_upload: o.auto_upload, anonymous_upload: o.anonymous_upload, personal_release: o.personal_release, stream_optimized: o.stream_optimized };
+  checkPromo(o);
+  const p = {
+    review: o.review, auto_upload: o.auto_upload, anonymous_upload: o.anonymous_upload, personal_release: o.personal_release, stream_optimized: o.stream_optimized,
+    free: o.free, free_days: o.free_days, doubleup: !!o.doubleup, doubleup_days: o.doubleup_days, featured: !!o.featured,
+  };
   const n = String(o.screenshot_count ?? "").trim();
   if (n) {
     if (!/^\d+$/.test(n) || +n < 1 || +n > 200) throw new Error("Screenshots per job must be a whole number from 1 to 200");
@@ -492,7 +537,9 @@ function drawDuplicates() {
 }
 
 /* ---------------- JOBS tab ---------------- */
-const jobsUI = { list: h("div"), detail: h("div"), toolbar: h("div", { class: "row" }), logEl: null, logCount: 0, logJob: null, gallery: null, galleryDir: null, sig: "" };
+// The detail panel is sticky (see .jobs-detail in style.css) so the open job stays in view while the job list scrolls.
+const jobsUI = { list: h("div"), detail: h("div", { class: "jobs-detail" }), toolbar: h("div", { class: "row" }), logEl: null, logCount: 0, logJob: null, gallery: null, galleryDir: null, sig: "", lastDetail: null };
+const planDrafts = new Map();   // job id -> edited upload form; survives re-renders and failed attempts
 const STEPS = ["Frames", "Review", "Images", "Finalize", "Upload"];
 const STAGE_IDX = { starting: 0, frames: 0, review: 1, hosting: 2, finalize: 3, confirm: 4, uploading: 4 };
 const STATUS_TEXT = { queued: "Queued", running: "Running", awaiting_review: "Needs review", awaiting_confirm: "Confirm upload", finished: "Finished", failed: "Failed", cancelled: "Cancelled", interrupted: "Interrupted" };
@@ -533,6 +580,9 @@ function jobOverrides(j) {
   if (o.screenshot_count) bits.push(`${o.screenshot_count} screenshots`);
   if (o.category) bits.push(`category ${o.category}`);
   if (o.save_path) bits.push(`save to ${o.save_path}`);
+  if (o.free) bits.push(`free ${o.free}%` + (o.free_days ? ` for ${o.free_days}d` : ""));
+  if (o.doubleup) bits.push("double upload" + (o.doubleup_days ? ` for ${o.doubleup_days}d` : ""));
+  if (o.featured) bits.push("featured");
   return bits.join(" · ");
 }
 
@@ -547,7 +597,7 @@ function drawJobDetail(force) {
   const j = state.jobs.find((x) => x.id === state.openJob);
   if (!j) {
     jobsUI.detail.replaceChildren(h("div", { class: "panel muted" }, "Select a job to see progress, images and the log."));
-    Object.assign(jobsUI, { logJob: null, gallery: null, galleryDir: null, sig: "" });
+    Object.assign(jobsUI, { logJob: null, gallery: null, galleryDir: null, sig: "", lastDetail: null });
     return;
   }
 
@@ -575,6 +625,8 @@ function drawJobDetail(force) {
       jobsUI.logCount = 0; jobsUI.logJob = j.id;
     }
     const overrides = jobOverrides(j);
+    // The panel scrolls on its own (it is sticky), so keep its position across re-renders of the same job.
+    const keepTop = jobsUI.lastDetail === j.id ? jobsUI.detail.scrollTop : 0;
     jobsUI.detail.replaceChildren(h("div", { class: "panel" },
       h("div", { class: "row" }, h("h2", { class: "grow" }, j.name || j.target), h("span", { class: "pill " + j.status }, STATUS_TEXT[j.status])),
       h("div", { class: "muted small", style: "word-break:break-all" }, j.target),
@@ -590,6 +642,8 @@ function drawJobDetail(force) {
         !isActive(j) && h("button", { class: "btn", onclick: guard(async () => { await api("DELETE", `/api/jobs/${j.id}`); state.openJob = null; await refreshJobs(); }) }, "Remove from list")),
       jobsUI.gallery && h("div", {}, h("div", { class: "spacer" }), jobsUI.gallery.el),
       h("h2", { style: "margin-top:14px" }, "Log"), jobsUI.logEl));
+    jobsUI.detail.scrollTop = keepTop;
+    jobsUI.lastDetail = j.id;
   }
   if (jobsUI.gallery && (rerender || j.regenerating || ["frames", "review"].includes(j.stage))) jobsUI.gallery.refresh();
   pullLog(j);
@@ -606,15 +660,72 @@ function reviewControls(j) {
       h("button", { class: "btn", disabled: j.regenerating, onclick: guard(async () => { await api("POST", `/api/jobs/${j.id}/regenerate`, {}); toast("Regenerating frames…"); await refreshJobs(); }) }, j.regenerating ? "Regenerating…" : "Regenerate all frames")));
 }
 
+const WHOLE_FIELDS = {
+  category_id: "Category", type_id: "Type", resolution_id: "Resolution", tmdb: "TMDB id", imdb: "IMDb id", tvdb: "TVDB id",
+  season_number: "Season", episode_number: "Episode",
+};
+
+// Pre-upload check: the summary the script printed plus a form to change anything before it is sent.
+// Edits live in planDrafts so polling, a failed upload or an invalid edit never throws them away.
 function confirmControls(j) {
   if (j.status !== "awaiting_confirm") return null;
+  const pf = j.plan_fields || {};
+  const summary = h("div", { class: "plan" }, j.plan.join("\n"));
+  const post = (body) => guard(async () => { await api("POST", `/api/jobs/${j.id}/confirm`, body); await refreshJobs(); });
+  const cancel = h("button", { class: "btn", onclick: post({ go: false }) }, "Cancel upload");
+  if (!pf.fields) {   // no editable data (should not happen): fall back to a plain confirmation
+    return h("div", { class: "notice" }, h("strong", {}, "Ready to upload to the tracker"), summary,
+      j.error && h("div", { class: "err small" }, "Previous attempt: " + j.error),
+      h("div", { class: "row" }, h("button", { class: "btn primary", onclick: post({ go: true }) }, "Upload now"), cancel));
+  }
+  if (!planDrafts.has(j.id)) planDrafts.set(j.id, { ...pf.fields });
+  const d = planDrafts.get(j.id), base = pf.fields, ch = pf.choices || {};
+  const edited = () => Object.keys(d).filter((k) => d[k] !== base[k]);
+
+  const text = (key, label, cls = "") => h("div", { class: "f " + cls }, h("label", {}, label),
+    h("input", { type: "text", value: d[key] ?? "", oninput: (e) => { d[key] = e.target.value; } }));
+  const whole = (key, label, blankZero) => h("div", { class: "f" }, h("label", {}, label),
+    h("input", { type: "number", min: 0, step: 1, value: blankZero && !d[key] ? "" : String(d[key] ?? ""),
+      oninput: (e) => { d[key] = e.target.value === "" ? 0 : Number(e.target.value); } }));
+  const pick = (key, label, options) => {
+    const opts = options.some(([id]) => id === d[key]) ? options : [...options, [d[key], "custom"]];
+    const sel = h("select", { onchange: (e) => { d[key] = Number(e.target.value); } },
+      opts.map(([id, name]) => h("option", { value: String(id) }, `${name} (id ${id})`)));
+    sel.value = String(d[key]);
+    return h("div", { class: "f" }, h("label", {}, label), sel);
+  };
+  const flag = (key, label) => h("label", { class: "chk" },
+    h("input", { type: "checkbox", checked: !!d[key], onchange: (e) => { d[key] = e.target.checked ? 1 : 0; } }), label);
+
+  const form = h("div", { class: "editform" },
+    text("name", "Name", "wide"),
+    pick("category_id", "Category", ch.categories || []), pick("type_id", "Type", ch.types || []), pick("resolution_id", "Resolution", ch.resolutions || []),
+    whole("tmdb", "TMDB id"), whole("imdb", "IMDb id (blank = none)", true), whole("tvdb", "TVDB id (blank = none)", true),
+    "season_number" in d && whole("season_number", "Season"), "episode_number" in d && whole("episode_number", "Episode"),
+    h("div", { class: "wide row" }, flag("anonymous", "Anonymous"), flag("personal_release", "Personal release"), flag("stream", "Stream optimised"), flag("sd", "SD")),
+    h("div", { class: "wide" }, promoControls(d)),
+    h("div", { class: "f wide" }, h("label", {}, "Description"),
+      h("textarea", { rows: 8, value: d.description ?? "", oninput: (e) => { d.description = e.target.value; } })));
+
+  const upload = guard(async () => {
+    checkPromo(d);
+    for (const [k, label] of Object.entries(WHOLE_FIELDS)) {
+      if (k in d && !Number.isInteger(d[k])) throw new Error(`${label} must be a whole number`);
+    }
+    const fields = Object.fromEntries(edited().map((k) => [k, d[k]]));
+    await api("POST", `/api/jobs/${j.id}/confirm`, { go: true, fields });
+    await refreshJobs();
+  });
   return h("div", { class: "notice" },
     h("strong", {}, "Ready to upload to the tracker"),
-    h("div", { class: "plan" }, j.plan.join("\n")),
+    summary,
+    h("div", { class: "muted small" }, "Change anything below before uploading; only the fields you edit are changed."),
+    form,
     j.error && h("div", { class: "err small" }, "Previous attempt: " + j.error),
     h("div", { class: "row" },
-      h("button", { class: "btn primary", onclick: guard(async () => { await api("POST", `/api/jobs/${j.id}/confirm`, { go: true }); await refreshJobs(); }) }, "Upload now"),
-      h("button", { class: "btn", onclick: guard(async () => { await api("POST", `/api/jobs/${j.id}/confirm`, { go: false }); await refreshJobs(); }) }, "Cancel upload")));
+      h("button", { class: "btn primary", onclick: upload }, "Upload now"),
+      h("button", { class: "btn", title: "Throw away your edits and go back to the detected values", onclick: () => { planDrafts.delete(j.id); drawJobDetail(true); } }, "Reset edits"),
+      cancel));
 }
 
 async function pullLog(j) {
@@ -630,6 +741,10 @@ async function pullLog(j) {
 async function refreshJobs() {
   const r = await api("GET", "/api/jobs");
   state.jobs = r.jobs; state.maxConc = r.max_concurrent;
+  for (const id of [...planDrafts.keys()]) {   // drafts only matter while the job can still ask for confirmation
+    const job = r.jobs.find((x) => x.id === id);
+    if (!job || !isActive(job)) planDrafts.delete(id);
+  }
   const n = r.jobs.filter(isActive).length, w = r.jobs.filter((j) => j.status.startsWith("awaiting")).length;
   const b = $("#jobs-badge"); b.hidden = !n; b.textContent = w ? `${w} waiting` : n;
   if (state.tab === "jobs") {
@@ -724,6 +839,12 @@ function switchTab(tab) {
 document.querySelectorAll("#tabs button").forEach((b) => b.addEventListener("click", () => switchTab(b.dataset.tab)));
 
 (async function boot() {
+  // The sticky job panel sits just below the sticky header, whose height changes when it wraps.
+  const header = document.querySelector("header");
+  const syncHeader = () => document.documentElement.style.setProperty("--header-h", header.offsetHeight + "px");
+  syncHeader();
+  if (window.ResizeObserver) new ResizeObserver(syncHeader).observe(header);
+  else window.addEventListener("resize", syncHeader);
   $("#tab-library").append(lib.root);
   buildJobs();
   await api("GET", "/api/config").then((c) => (state.config = c)).catch(() => {});

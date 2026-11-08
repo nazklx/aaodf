@@ -13,7 +13,7 @@ from pathlib import Path
 
 from flask import Flask, Response, abort, jsonify, make_response, redirect, request, send_file, send_from_directory
 
-from .jobs import ACTIVE, OUTPUT, ROOT, STATE_DIR, JobManager, clean_options, inspect_target
+from .jobs import ACTIVE, OUTPUT, ROOT, STATE_DIR, JobManager, clean_options, clean_plan_edits, inspect_target
 from .scanner import ScanBusy, ScanManager, ScanTooLarge
 
 VIDEO_EXTS = {".mkv", ".mp4"}
@@ -21,6 +21,8 @@ SENSITIVE = ("announce_url", "tmdb_api_key", "tracker_api_token", "upload_endpoi
 BOOL_KEYS = ("confirm_before_upload", "anonymous_upload", "personal_release", "stream_optimized")
 STR_KEYS = ("group_separator", "run_as_user", "tracker_search_endpoint")
 NUM_KEYS = ("screenshot_count", "screenshot_start_seconds", "screenshot_interval_seconds", "tracker_search_rate_limit")
+# Default promotion flags (set in config.json, overridable per job); read-only in the web UI.
+PROMO_KEYS = ("free", "free_days", "doubleup", "doubleup_days", "featured")
 MAX_ENTRIES = 5000
 COOKIE = "aaodf_token"
 
@@ -182,7 +184,14 @@ def create_app(fs_root: Path, token: str, max_concurrent: int = 1) -> Flask:
 
     @app.post("/api/jobs/<jid>/confirm")
     def job_confirm(jid):
-        return action(manager.confirm, jid, bool(request.get_json().get("go")))
+        body = request.get_json() or {}
+        fields = body.get("fields")
+        if fields is not None:
+            try:
+                fields = clean_plan_edits(fields)
+            except ValueError as exc:
+                abort(400, str(exc))
+        return action(manager.confirm, jid, bool(body.get("go")), fields)
 
     @app.post("/api/jobs/<jid>/regenerate")
     def job_regen(jid):
@@ -312,7 +321,7 @@ def create_app(fs_root: Path, token: str, max_concurrent: int = 1) -> Flask:
     @app.get("/api/config")
     def config_get():
         cfg = read_cfg()
-        out = {k: cfg.get(k) for k in BOOL_KEYS + STR_KEYS + NUM_KEYS}
+        out = {k: cfg.get(k) for k in BOOL_KEYS + STR_KEYS + NUM_KEYS + PROMO_KEYS}
         client = cfg.get("download_client")
         if isinstance(client, dict) and client:
             out["download_client"] = {k: client.get(k, "") for k in ("type", "url", "username", "category", "tags", "save_path", "download_dir")}
