@@ -1,6 +1,7 @@
 """Job queue that drives the existing CLI (`python -m src <target>`) as a subprocess.
 
-The CLI blocks on two stdin prompts (review images, confirm upload). This module
+The CLI blocks on two stdin prompts (review images, confirm upload; music, audiobooks and books
+skip the image review). This module
 watches its stdout for those prompts and answers them when the user clicks a
 button in the UI, so none of the pipeline code needs to change.
 """
@@ -18,7 +19,9 @@ import uuid
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 
+from src.config import MEDIA_TYPES
 from src.core import find_videos, episode_videos, episode_info
+from src.media import detect_kind, media_sources, normalize_hint
 
 ROOT = Path(__file__).resolve().parent.parent
 OUTPUT = ROOT / "output"
@@ -33,6 +36,11 @@ M_PLAN_END = "1) Upload now"
 M_CONFIRM = "0) Cancel"
 M_FIELDS = "PLAN_FIELDS "       # JSON describing the editable upload form (see src/tracker.py)
 M_BAD_EDIT = "Invalid edit:"
+M_CANNOT_UPLOAD = "Cannot upload:"   # non-video category / type ids are not set
+# MusicBrainz / Open Library progress lines printed by src/musicbrainz.py and src/openlibrary.py
+M_METADATA = ("Searching MusicBrainz", "Looking up MusicBrainz", "Matched on MusicBrainz", "No MusicBrainz match",
+              "MusicBrainz lookup", "Searching Open Library", "Matched on Open Library", "No Open Library match",
+              "Open Library lookup")
 
 # doubleup / featured are on/off per-job options like the others; free is a percentage and the
 # *_days values say how long a promotion lasts (0 = never expires).
@@ -48,7 +56,7 @@ PROMO_INT_OPTIONS = {
 PLAN_EDIT_KEYS = (
     "name", "description", "category_id", "type_id", "resolution_id", "tmdb", "imdb", "tvdb",
     "season_number", "episode_number", "anonymous", "personal_release", "stream", "sd",
-    "free", "free_days", "doubleup", "doubleup_days", "featured",
+    "free", "free_days", "doubleup", "doubleup_days", "featured", "source_url",
 )
 
 
@@ -84,11 +92,17 @@ def clean_options(raw: dict) -> dict:
     """Validate per-job options sent by the browser. Raises ValueError with a user-facing message.
 
     screenshot_count: overrides the setting for this job only.
+    media_type: auto / video / music / audiobook / book for this job only (overrides the setting).
     free / free_days / doubleup / doubleup_days / featured: promotion flags for this job's upload.
     category / save_path: override the download client's qBittorrent category / save path
     (Transmission: save_path becomes its download directory) for this job only.
     """
     out = {k: bool(raw[k]) for k in BOOL_OPTIONS if k in raw}
+    media_type = raw.get("media_type")
+    if media_type not in (None, ""):
+        if not isinstance(media_type, str) or media_type.strip().lower() not in MEDIA_TYPES:
+            raise ValueError("Media type must be one of: " + ", ".join(MEDIA_TYPES))
+        out["media_type"] = media_type.strip().lower()
     count = raw.get("screenshot_count")
     if count not in (None, ""):
         out["screenshot_count"] = _whole_number(count, "Screenshot count", *SCREENSHOT_RANGE)
@@ -110,13 +124,25 @@ def clean_options(raw: dict) -> dict:
     return out
 
 
-def inspect_target(target: Path) -> dict:
+def inspect_target(target: Path, hint: object = "auto") -> dict:
     """Predict what the CLI will do with `target` (same logic as src/cli.py)."""
     if not target.exists():
         return {"ok": False, "error": "Path does not exist"}
+    hint = normalize_hint(hint)
+    kind = detect_kind(target, hint)
+    if kind is None:
+        what = "supported media files (video, music, audiobook or book)" if hint == "auto" else f"{hint} files"
+        return {"ok": False, "error": f"No {what} found"}
+    if kind != "video":
+        sources = media_sources(target, kind)
+        release = target.name if target.is_dir() else target.stem
+        out_dir = f"UPLOAD.{release}"
+        return {
+            "ok": True, "kind": kind, "videos": 0, "sources": len(sources), "first": sources[0].name,
+            "release": release, "name": release, "out_dir": out_dir,
+            "output_exists": (OUTPUT / out_dir).exists(), "tv": False,
+        }
     videos = find_videos(target)
-    if not videos:
-        return {"ok": False, "error": "No .mkv/.mp4 files found"}
     sources = episode_videos(videos)
     first = sources[0]
     multi = len(sources) > 1
@@ -125,6 +151,7 @@ def inspect_target(target: Path) -> dict:
     out_dir = f"UPLOAD.{name}"
     return {
         "ok": True,
+        "kind": "video",
         "videos": len(videos),
         "sources": len(sources),
         "first": first.name,
@@ -151,6 +178,8 @@ class Job:
     name: str | None = None
     out_dir: str | None = None
     link: str | None = None
+    media_kind: str = ""                 # video / music / audiobook / book, as reported by the CLI
+    source_link: str | None = None       # MusicBrainz / Open Library link that goes to the tracker
     uploaded: bool = False
     error: str | None = None
     plan: list = field(default_factory=list)
@@ -419,7 +448,7 @@ class JobManager:
         for k in JOB_OPTION_KEYS:
             if k in job.options:
                 cfg[k] = bool(job.options[k])
-        for k in ("screenshot_count", *PROMO_INT_OPTIONS):
+        for k in ("screenshot_count", "media_type", *PROMO_INT_OPTIONS):
             if k in job.options:
                 cfg[k] = job.options[k]
         category, save_path = job.options.get("category"), job.options.get("save_path")
@@ -449,7 +478,7 @@ class JobManager:
         job = self.jobs[jid]
         cfg_path = None
         try:
-            info = inspect_target(Path(job.target))
+            info = inspect_target(Path(job.target), job.options.get("media_type", "auto"))
             if not info["ok"]:
                 with self.lock:
                     self._append(jid, f"Error: {info['error']}: {job.target}")
@@ -522,6 +551,15 @@ class JobManager:
             except ValueError:
                 parsed = None
             job.plan_fields = parsed if isinstance(parsed, dict) else {}
+        elif s.startswith("Media type:"):
+            job.media_kind = s.split(":", 1)[1].strip()
+            changed = True
+        elif s.startswith("Source link:") and not getattr(job, "_collecting", False):   # the plan summary has a line like it
+            job.source_link = s.split(":", 1)[1].strip()
+            changed = True
+        elif s.startswith(M_METADATA):
+            job.stage, job.detail = "metadata", s
+            changed = True
         elif m := re.match(r"Extracting (\d+) ", s):
             job.stage, job.frames_total, job.frames_done = "frames", int(m.group(1)), 0
             changed = True
@@ -567,7 +605,7 @@ class JobManager:
             job.error = None
         elif s.startswith("Link:"):
             job.link = s.split(":", 1)[1].strip()
-        elif s.startswith(("Upload failed", "Response:", M_BAD_EDIT)):
+        elif s.startswith(("Upload failed", "Response:", M_BAD_EDIT, M_CANNOT_UPLOAD)):
             job.error = s[:300]
         elif s.endswith("skipping tracker upload.") or s.startswith("Error:"):
             job.error = s[:300]
@@ -580,7 +618,7 @@ class JobManager:
     def _percent(j: Job) -> int:
         frac = lambda a, b: (min(a, b) / b) if b else 0
         return {
-            "queued": 0, "starting": 2,
+            "queued": 0, "starting": 2, "metadata": 30,
             "frames": 5 + int(35 * frac(j.frames_done, j.frames_total)),
             "review": 40,
             "hosting": 40 + int(40 * frac(j.hosted, j.hosted_total)),

@@ -8,7 +8,10 @@ import threading
 import requests
 from pathlib import Path
 
+from .config import config
 from .core import find_videos, episode_videos, episode_info, extract_frames, pause
+from .media import (KIND_LABELS, MEDIA_EXTS, build_nfo, detect_kind,
+                    lookup_media, media_sources, media_tags, meta_description, normalize_hint)
 from .models import Job
 from .tmdb import lookup_tmdb
 from .tracker import (build_torrent, host_screenshots, print_description_block,
@@ -19,11 +22,69 @@ def read_mediainfo(video: Path) -> str:
                           text=True, check=False, stdin=subprocess.DEVNULL).stdout
     return re.sub(r"^(Complete name\s*:\s*).*$", lambda m: m.group(1) + video.name, text, flags=__import__("re").M)
 
-def process_target(target: Path) -> bool:
-    videos = find_videos(target)
-    if not videos:
-        print(f"Skipping: No .mkv/.mp4 files found in: {target}")
+def print_torrent_details(job: Job) -> None:
+    print()
+    print("=" * 40)
+    print("TORRENT DETAILS:")
+    print(f"File: {job.torrent_path.name}")
+    if job.torrent_path.exists():
+        size_mb = job.torrent_path.stat().st_size / (1024 * 1024)
+        print(f"Size: {size_mb:.2f} MB")
+        print(f"Path: {job.torrent_path}")
+    else:
+        print("Status: Torrent file creation failed or incomplete.")
+    print("=" * 40)
+    print()
+
+def process_media_target(target: Path, kind: str) -> bool:
+    """Music (MusicBrainz), audiobooks and books (Open Library): no screenshots, the source link
+    of the match goes into the description and to the tracker."""
+    sources = media_sources(target, kind)
+    if not sources:
+        print(f"Skipping: no {KIND_LABELS[kind].lower()} files found in: {target}")
         return False
+    audio = kind in ("music", "audiobook")
+    if audio and not shutil.which("ffprobe"):
+        print("Error: ffprobe is not installed.")
+        return False
+
+    release = target.name if target.is_dir() else target.stem
+    out_dir = Path("output") / f"UPLOAD.{release}"
+    out_dir.mkdir(mode=0o755, parents=True, exist_ok=True)
+    job = Job(
+        target=target, sources=sources, first=sources[0], release=release, name=release,
+        out_dir=out_dir, torrent_path=out_dir / f"{release}.torrent",
+        nfo_path=out_dir / f"{release}.nfo", tv_hint=False, media_kind=kind,
+    )
+    print(f"Media type: {kind}")
+    torrent_thread = threading.Thread(target=build_torrent, args=(job,), daemon=True)
+    torrent_thread.start()
+
+    job.tags = media_tags(kind, sources)
+    job.meta = lookup_media(job)
+    update_description(job, overview=meta_description(job.meta) if job.meta else "")
+    if job.meta:
+        print(f"Source link: {job.meta.url}")
+    if torrent_thread.is_alive():
+        torrent_thread.join()
+    print_torrent_details(job)
+    print_description_block(job)
+
+    print("Generating nfo")
+    job.nfo_path.write_text(build_nfo(job), encoding="utf-8")
+    mediainfo_text = read_mediainfo(sources[0]) if audio and shutil.which("mediainfo") else ""
+    print()
+    return upload_release(job, mediainfo_text)
+
+def process_target(target: Path, media_type: str | None = None) -> bool:
+    kind = detect_kind(target, media_type or config.get("media_type", "auto"))
+    if kind is None:
+        print(f"Skipping: no supported video, music, audiobook or book files found in: {target}")
+        return False
+    if kind != "video":
+        return process_media_target(target, kind)
+    print("Media type: video")
+    videos = find_videos(target)
     sources = episode_videos(videos)
     first = sources[0]
     multi = len(sources) > 1
@@ -55,18 +116,7 @@ def process_target(target: Path) -> bool:
     if torrent_thread.is_alive():
         torrent_thread.join()
 
-    print()
-    print("=" * 40)
-    print("TORRENT DETAILS:")
-    print(f"File: {job.torrent_path.name}")
-    if job.torrent_path.exists():
-        size_mb = job.torrent_path.stat().st_size / (1024 * 1024)
-        print(f"Size: {size_mb:.2f} MB")
-        print(f"Path: {job.torrent_path}")
-    else:
-        print("Status: Torrent file creation failed or incomplete.")
-    print("=" * 40)
-    print()
+    print_torrent_details(job)
 
     job.info = lookup_tmdb(job.release, tv_hint=job.tv_hint)
     update_description(job, overview=job.info.overview if job.info else "")
@@ -89,19 +139,21 @@ def scan_download_directory(root: Path) -> list[Path] | None:
         key=lambda p: p.name.casefold(),
     )
     candidates.extend(sorted(
-        [p for p in root.iterdir() if p.is_file() and p.suffix.lower() in (".mkv", ".mp4")],
+        [p for p in root.iterdir() if p.is_file() and p.suffix.lower() in MEDIA_EXTS],
         key=lambda p: p.name.casefold(),
     ))
     if not candidates:
-        print("No folders or top-level .mkv/.mp4 files were found.")
+        print("No folders or top-level media files (video, audio, books) were found.")
         return []
 
     unmatched: list[Path] = []
     matched_count = 0
     skipped_count = 0
     print(f"Scanning {len(candidates)} folders/files in: {root}\n")
+    hint = normalize_hint(config.get("media_type", "auto"))
     for index, candidate in enumerate(candidates, 1):
-        query = tracker_search_title(candidate.name)
+        kind = detect_kind(candidate, hint) or "video"
+        query = tracker_search_title(candidate.name, kind)
         print(f"[{index}/{len(candidates)}] Searching: {candidate.name}")
         print(f"    Tracker query: {query}")
         try:
@@ -127,9 +179,9 @@ def scan_download_directory(root: Path) -> list[Path] | None:
                 print(f"      ... and {len(matches) - 5} more")
         else:
             print("    No tracker matches.")
-            if candidate.is_dir() and not find_videos(candidate):
+            if candidate.is_dir() and detect_kind(candidate, hint) is None:
                 skipped_count += 1
-                print("    Skipping batch list: folder contains no supported .mkv/.mp4 media.")
+                print("    Skipping batch list: folder contains no supported media.")
             else:
                 unmatched.append(candidate)
 
@@ -172,7 +224,16 @@ def select_batch(items: list[Path]) -> list[Path]:
 
 
 def main() -> int:
-    if len(sys.argv) >= 2 and sys.argv[1] == "--scan":
+    args = sys.argv[1:]
+    media_type = None
+    if "--type" in args:
+        i = args.index("--type")
+        media_type = args[i + 1].lower() if i + 1 < len(args) else ""
+        del args[i:i + 2]
+        if media_type not in ("auto", "video", "music", "audiobook", "book"):
+            print("--type must be one of: auto, video, music, audiobook, book")
+            return 1
+    if args and args[0] == "--scan":
         raw_directory = input("qBittorrent download directory to scan: ").strip().strip('"')
         if not raw_directory:
             print("No directory provided.")
@@ -189,18 +250,18 @@ def main() -> int:
         successes = 0
         for index, target in enumerate(selected, 1):
             print(f"\n{'=' * 60}\nBATCH ITEM {index}/{len(selected)}: {target.name}\n{'=' * 60}")
-            successes += bool(process_target(target))
+            successes += bool(process_target(target, media_type))
         print(f"\nBatch finished: {successes}/{len(selected)} uploaded successfully.")
         return 0 if successes == len(selected) else 1
 
-    if len(sys.argv) < 2:
-        print(f"Usage: {sys.argv[0]} <file or folder> | --scan")
+    if not args:
+        print(f"Usage: {sys.argv[0]} [--type auto|video|music|audiobook|book] <file or folder> | --scan")
         return 1
-    target = Path(os.path.abspath(sys.argv[1]))
+    target = Path(os.path.abspath(args[0]))
     if not target.exists():
         print(f"Error: Path does not exist: {target}")
         return 1
-    return 0 if process_target(target) else 1
+    return 0 if process_target(target, media_type) else 1
 
 if __name__ == "__main__":
     try:

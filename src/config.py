@@ -28,6 +28,45 @@ DEFAULT_CONFIG = {
     # ~60/min many UNIT3D trackers allow per API token, since pagination also counts.
     "tracker_search_rate_limit": 30,
     "download_client": None,
+
+    # ---- Music (MusicBrainz) and books / audiobooks (Open Library) ----
+    # "auto" detects video / music / audiobook / book from the files. Force one with
+    # video, music, audiobook or book (also settable per job in the web UI or with --type).
+    "media_type": "auto",
+    "musicbrainz_enabled": True,
+    "openlibrary_enabled": True,
+    # Without a match there is no source link to hand to the tracker, so by default the upload is
+    # skipped. Set to false to upload anyway (named after the folder, description without a link).
+    "require_metadata_match": True,
+    # Put the cover (Cover Art Archive / Open Library covers) at the top of the description.
+    "include_cover_in_description": True,
+    # MusicBrainz and Open Library ask API clients to identify themselves: put a contact in here,
+    # e.g. "aaodf/1.0 ( you@example.com )".
+    "metadata_user_agent": "aaodf/1.0 (+https://github.com/nazklx/aaodf)",
+    "metadata_timeout_seconds": 30,
+    "musicbrainz_url": "https://musicbrainz.org",
+    "musicbrainz_request_interval": 1.1,    # seconds between MusicBrainz requests (they allow 1/s)
+    "coverart_url": "https://coverartarchive.org",
+    "openlibrary_url": "https://openlibrary.org",
+    "openlibrary_covers_url": "https://covers.openlibrary.org",
+    "openlibrary_request_interval": 1.0,    # seconds between Open Library requests
+    # How book / audiobook folders are named when there are no usable tags:
+    # "author_title" ("Author - Title (Year)") or "title_author".
+    "book_name_order": "author_title",
+    # Tracker ids for non-video uploads. 0 = not set: the upload is blocked until you set them
+    # here or type them into the pre-upload form.
+    "music_category_id": 0,
+    "audiobook_category_id": 0,
+    "book_category_id": 0,
+    "music_type_id": 0,
+    "audiobook_type_id": 0,
+    "book_type_id": 0,
+    "media_resolution_id": 0,     # resolution_id sent for non-video uploads; 0 = leave it out
+    # Name of the extra upload form field that carries the MusicBrainz / Open Library link.
+    # "" = no extra field; the link is always part of the description either way.
+    "musicbrainz_link_field": "",
+    "openlibrary_link_field": "",
+
     "screenshot_count": 18,
     "screenshot_start_seconds": 60,
     "screenshot_interval_seconds": 240
@@ -46,6 +85,8 @@ RESOLUTION_IDS = {
     "4320p": 1, "2160p": 2, "1080p": 3, "1080i": 4, "720p": 5,
     "576p": 6, "576i": 7, "480p": 8, "480i": 9, "Other": 10,
 }
+
+MEDIA_TYPES = ("auto", "video", "music", "audiobook", "book")
 
 def load_config() -> dict:
     if not CONFIG_FILE.exists():

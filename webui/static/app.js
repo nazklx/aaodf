@@ -175,8 +175,13 @@ function cfgDefaults() {
     free: Number(c.free) || 0, free_days: Number(c.free_days) || 0,
     doubleup: c.doubleup ? 1 : 0, doubleup_days: Number(c.doubleup_days) || 0, featured: c.featured ? 1 : 0,
     screenshot_count: "", category: "", save_path: "",
+    media_type: c.media_type || "auto",
   };
 }
+
+const MEDIA_TYPES = [["auto", "Auto-detect"], ["video", "Video (TMDB)"], ["music", "Music (MusicBrainz)"],
+  ["audiobook", "Audiobook (Open Library)"], ["book", "Book (Open Library)"]];
+const FILE_ICONS = { video: "🎞 ", audio: "🎵 ", book: "📖 " };
 
 /* Free / double upload / featured controls, shared by the options panel and the pre-upload editor.
  * `m` is edited in place: free (0 = off, otherwise 1-100 %), free_days, doubleup (0/1),
@@ -231,6 +236,9 @@ function optionsPanel(o) {
       oninput: (e) => { o[key] = e.target.value; } }),
     hint && h("div", { class: "muted small" }, hint));
   sync();
+  const typeSel = h("select", { onchange: (e) => { o.media_type = e.target.value; } },
+    MEDIA_TYPES.map(([v, label]) => h("option", { value: v }, label)));
+  typeSel.value = o.media_type || "auto";
   return h("div", { class: "opts" },
     chk("review", "Pause to review images before they are hosted", "Matches the CLI's ‘delete unwanted images’ pause"),
     chk("auto_upload", "Upload to tracker without asking", "Skips the final confirmation"),
@@ -238,7 +246,9 @@ function optionsPanel(o) {
     promoControls(o),
     note,
     h("div", { class: "optfields" },
-      field("screenshot_count", "Screenshots per job", `${c.screenshot_count ?? 18} (from Settings)`, null, "number"),
+      h("div", { class: "f" }, h("label", {}, "Media type"), typeSel,
+        h("div", { class: "muted small" }, "Auto-detect uses the file types. Music is matched on MusicBrainz, audiobooks and books on Open Library; the match link is sent to the tracker.")),
+      field("screenshot_count", "Screenshots per job (video)", `${c.screenshot_count ?? 18} (from Settings)`, null, "number"),
       field("category", "qBittorrent category", client && client.category ? `${client.category} (from Settings)` : "none", client ? "qBittorrent only." : null, "text", { disabled: !client }),
       field("save_path", "Target directory", defaultDir ? `${defaultDir} (from Settings)` : "client default", client ? "As seen by the download client." : null, "text", { disabled: !client }),
       !client && h("div", { class: "muted small" }, "No download client is set in Settings, so category and target directory are ignored.")));
@@ -249,6 +259,7 @@ function jobPayload(o) {
   const p = {
     review: o.review, auto_upload: o.auto_upload, anonymous_upload: o.anonymous_upload, personal_release: o.personal_release, stream_optimized: o.stream_optimized,
     free: o.free, free_days: o.free_days, doubleup: !!o.doubleup, doubleup_days: o.doubleup_days, featured: !!o.featured,
+    media_type: o.media_type || "auto",
   };
   const n = String(o.screenshot_count ?? "").trim();
   if (n) {
@@ -328,8 +339,8 @@ function drawList() {
       h("td", {}, h("input", { type: "checkbox", checked: state.selected.has(e.path), onchange: () => { toggleSel(e); drawList(); drawTray(); } })),
       h("td", { class: "name" }, e.dir
         ? h("button", { class: "link dir", onclick: () => goto(e.path) }, "📁 " + e.name)
-        : h("button", { class: "link", onclick: () => { toggleSel(e); drawList(); drawTray(); } }, (e.video ? "🎞 " : "📄 ") + e.name),
-        e.video && h("span", { class: "tag" }, "video")),
+        : h("button", { class: "link", onclick: () => { toggleSel(e); drawList(); drawTray(); } }, (FILE_ICONS[e.kind] || "📄 ") + e.name),
+        e.kind && h("span", { class: "tag" }, e.kind)),
       h("td", { class: "num" }, fmtSize(e.size)), h("td", { class: "num" }, fmtTime(e.mtime))))),
     ),
     !rows.length && h("div", { class: "empty" }, "Empty"),
@@ -343,7 +354,7 @@ function drawTray() {
     h("h2", {}, `Selection (${n})`),
     n ? h("ul", {}, [...state.selected].map(([p]) => h("li", {},
       h("button", { class: "btn small", title: "Remove", onclick: () => { state.selected.delete(p); drawList(); drawTray(); } }, "✕"),
-      h("span", { title: p }, "‎" + p)))) : h("p", { class: "muted" }, "Tick files or folders (a video file, or a release folder) to run the script on."),
+      h("span", { title: p }, "‎" + p)))) : h("p", { class: "muted" }, "Tick files or folders (a video, music or audiobook file, an ebook, or a release folder) to run the script on."),
     ...[...state.selected.keys()].filter((p) => files.inspect[p]).map((p) => h("div", { class: "insp" }, describe(p, files.inspect[p]))),
     optionsPanel(files.opts),
     h("div", { class: "row" },
@@ -354,12 +365,13 @@ function drawTray() {
 
 function describe(p, i) {
   if (!i.ok) return `${p.split("/").pop()}: ${i.error}`;
-  return `${i.name} → ${i.sources} source video(s) of ${i.videos}${i.tv ? ", TV" : ""}; output ${i.out_dir}${i.output_exists ? " (exists, will be overwritten)" : ""}`;
+  const what = i.kind && i.kind !== "video" ? `${i.kind}, ${i.sources} file(s)` : `${i.sources} source video(s) of ${i.videos}${i.tv ? ", TV" : ""}`;
+  return `${i.name} → ${what}; output ${i.out_dir}${i.output_exists ? " (exists, will be overwritten)" : ""}`;
 }
 
 async function inspectAll() {
   for (const p of state.selected.keys()) {
-    files.inspect[p] = await api("GET", "/api/inspect?path=" + enc(p)).catch((e) => ({ ok: false, error: e.message }));
+    files.inspect[p] = await api("GET", "/api/inspect?path=" + enc(p) + "&type=" + enc((files.opts && files.opts.media_type) || "auto")).catch((e) => ({ ok: false, error: e.message }));
     drawTray();
   }
 }
@@ -383,7 +395,7 @@ function buildDuplicates() {
   duplicatesUI.root.replaceChildren(
     h("div", { class: "panel" },
       h("h2", {}, "Find tracker duplicates"),
-      h("p", { class: "muted small" }, "Select a qBittorrent-style download directory. The scanner checks each immediate subfolder as one release and each top-level MKV/MP4 file individually; it does not descend into loose files or treat files inside folders separately."),
+      h("p", { class: "muted small" }, "Select a qBittorrent-style download directory. The scanner checks each immediate subfolder as one release and each top-level video, audio or ebook file individually; it does not descend into loose files or treat files inside folders separately. Media type is auto-detected unless a default is set in Settings."),
       h("div", { class: "row" }, duplicatesUI.path,
         h("button", { class: "btn", onclick: guard(openDirectoryPicker) }, "Browse"),
         duplicatesUI.scanBtn, duplicatesUI.cancelBtn),
@@ -531,7 +543,7 @@ function drawDuplicates() {
   const matchedPanel = h("div", { class: "panel" }, h("h2", {}, `Possible duplicates (${matched.length})`),
     matched.length ? h("div", { class: "dup-list" }, matchedRows) : h("div", { class: "empty" }, running ? "Nothing yet…" : "No tracker matches were found."));
   const skippedPanel = skipped.length ? h("div", { class: "panel" }, h("h2", {}, `Skipped (${skipped.length})`),
-    h("p", { class: "muted small" }, "These folders contain no supported MKV/MP4 video, so they were not searched and cannot be queued."),
+    h("p", { class: "muted small" }, "These folders contain no supported media (video, music, audiobook or book files), so they were not searched and cannot be queued."),
     ...skipped.map((item) => h("div", { class: "muted small" }, item.name))) : null;
   duplicatesUI.results.replaceChildren(unmatchedPanel, h("div", { class: "spacer" }), matchedPanel, skippedPanel);
 }
@@ -542,6 +554,11 @@ const jobsUI = { list: h("div"), detail: h("div", { class: "jobs-detail" }), too
 const planDrafts = new Map();   // job id -> edited upload form; survives re-renders and failed attempts
 const STEPS = ["Frames", "Review", "Images", "Finalize", "Upload"];
 const STAGE_IDX = { starting: 0, frames: 0, review: 1, hosting: 2, finalize: 3, confirm: 4, uploading: 4 };
+// Music, audiobooks and books have no screenshots: metadata lookup, then the usual finalize / upload.
+const STEPS_MEDIA = ["Metadata", "Finalize", "Upload"];
+const STAGE_IDX_MEDIA = { starting: 0, metadata: 0, finalize: 1, confirm: 2, uploading: 2 };
+const isMediaJob = (j) => !!j.media_kind && j.media_kind !== "video";
+const safeUrl = (u) => (/^https?:\/\//i.test(u || "") ? u : null);
 const STATUS_TEXT = { queued: "Queued", running: "Running", awaiting_review: "Needs review", awaiting_confirm: "Confirm upload", finished: "Finished", failed: "Failed", cancelled: "Cancelled", interrupted: "Interrupted" };
 const isActive = (j) => ["queued", "running", "awaiting_review", "awaiting_confirm"].includes(j.status);
 
@@ -577,6 +594,7 @@ function jobLine(j) {
 
 function jobOverrides(j) {
   const o = j.options || {}, bits = [];
+  if (o.media_type && o.media_type !== "auto") bits.push(`type ${o.media_type}`);
   if (o.screenshot_count) bits.push(`${o.screenshot_count} screenshots`);
   if (o.category) bits.push(`category ${o.category}`);
   if (o.save_path) bits.push(`save to ${o.save_path}`);
@@ -603,7 +621,7 @@ function drawJobDetail(force) {
 
   // The gallery is re-evaluated from the job's current state on every poll (it used to be
   // decided once at first render, so images/checkboxes only appeared after leaving the tab).
-  const wantGallery = !!j.out_dir && !["queued", "starting"].includes(j.stage);
+  const wantGallery = !!j.out_dir && !isMediaJob(j) && !["queued", "starting"].includes(j.stage);
   const reviewing = j.status === "awaiting_review";
   let galleryChanged = false;
   if (!wantGallery) {
@@ -614,11 +632,12 @@ function drawJobDetail(force) {
   }
   if (jobsUI.gallery) jobsUI.gallery.configure({ editable: reviewing || !isActive(j), onKeep: reviewing ? keepSelected(j.id) : null, busy: j.regenerating });
 
-  const sig = JSON.stringify([j.id, j.status, j.stage, j.regenerating, j.plan, j.error, j.link, Math.floor(j.percent / 5)]);
+  const sig = JSON.stringify([j.id, j.status, j.stage, j.regenerating, j.plan, j.error, j.link, j.media_kind, j.source_link, Math.floor(j.percent / 5)]);
   const rerender = force || galleryChanged || sig !== jobsUI.sig || jobsUI.logJob !== j.id;
   if (rerender) {
     jobsUI.sig = sig;
-    const cur = STAGE_IDX[j.stage] ?? -1;
+    const media = isMediaJob(j), steps = media ? STEPS_MEDIA : STEPS;
+    const cur = (media ? STAGE_IDX_MEDIA : STAGE_IDX)[j.stage] ?? -1;
     const done = j.status === "finished";
     if (jobsUI.logJob !== j.id) {   // keep the same <pre> (and its scroll position) while the same job stays open
       jobsUI.logEl = h("pre", { class: "log" });
@@ -632,9 +651,11 @@ function drawJobDetail(force) {
       h("div", { class: "muted small", style: "word-break:break-all" }, j.target),
       overrides && h("div", { class: "muted small" }, "Overrides: " + overrides),
       h("div", { class: "bar" }, h("div", { style: `width:${done && j.uploaded ? 100 : j.percent}%` })),
-      h("div", { class: "steps" }, STEPS.map((s, i) => h("span", { class: done ? "past" : i < cur ? "past" : i === cur && isActive(j) ? "now" : "" }, s))),
+      h("div", { class: "steps" }, steps.map((s, i) => h("span", { class: done ? "past" : i < cur ? "past" : i === cur && isActive(j) ? "now" : "" }, s))),
       j.error && h("div", { class: "err" }, j.error),
       j.link && h("div", {}, "Link: ", h("a", { href: j.link, target: "_blank", rel: "noreferrer noopener" }, j.link)),
+      j.source_link && h("div", {}, "Source link (sent to the tracker): ",
+        safeUrl(j.source_link) ? h("a", { href: j.source_link, target: "_blank", rel: "noreferrer noopener" }, j.source_link) : j.source_link),
       reviewControls(j), confirmControls(j),
       h("div", { class: "row" },
         isActive(j) && h("button", { class: "btn danger", onclick: guard(async () => { if (confirm("Cancel this job?")) { await api("POST", `/api/jobs/${j.id}/cancel`, {}); await refreshJobs(); } }) }, "Cancel job"),
@@ -697,18 +718,31 @@ function confirmControls(j) {
   const flag = (key, label) => h("label", { class: "chk" },
     h("input", { type: "checkbox", checked: !!d[key], onchange: (e) => { d[key] = e.target.checked ? 1 : 0; } }), label);
 
-  const form = h("div", { class: "editform" },
+  // Music, audiobooks and books: tracker ids come from the config (no category / type lists), no
+  // resolution / TMDB ids, and the MusicBrainz / Open Library link is editable.
+  const media = !!pf.media_kind && pf.media_kind !== "video";
+  const description = h("div", { class: "f wide" }, h("label", {}, "Description"),
+    h("textarea", { rows: 8, value: d.description ?? "", oninput: (e) => { d.description = e.target.value; } }));
+  const form = media ? h("div", { class: "editform" },
+    text("name", "Name", "wide"),
+    whole("category_id", "Category id"), whole("type_id", "Type id"),
+    text("source_url", "Source link (MusicBrainz / Open Library)", "wide"),
+    h("div", { class: "wide row" }, flag("anonymous", "Anonymous"), flag("personal_release", "Personal release")),
+    h("div", { class: "wide" }, promoControls(d)),
+    description) : h("div", { class: "editform" },
     text("name", "Name", "wide"),
     pick("category_id", "Category", ch.categories || []), pick("type_id", "Type", ch.types || []), pick("resolution_id", "Resolution", ch.resolutions || []),
     whole("tmdb", "TMDB id"), whole("imdb", "IMDb id (blank = none)", true), whole("tvdb", "TVDB id (blank = none)", true),
     "season_number" in d && whole("season_number", "Season"), "episode_number" in d && whole("episode_number", "Episode"),
     h("div", { class: "wide row" }, flag("anonymous", "Anonymous"), flag("personal_release", "Personal release"), flag("stream", "Stream optimised"), flag("sd", "SD")),
     h("div", { class: "wide" }, promoControls(d)),
-    h("div", { class: "f wide" }, h("label", {}, "Description"),
-      h("textarea", { rows: 8, value: d.description ?? "", oninput: (e) => { d.description = e.target.value; } })));
+    description);
 
   const upload = guard(async () => {
     checkPromo(d);
+    if (media && (!(d.category_id >= 1) || !(d.type_id >= 1))) {
+      throw new Error("Enter a category id and a type id (or set them in Settings → Music, audiobooks and books)");
+    }
     for (const [k, label] of Object.entries(WHOLE_FIELDS)) {
       if (k in d && !Number.isInteger(d[k])) throw new Error(`${label} must be a whole number`);
     }
@@ -780,14 +814,23 @@ function libOpen(name) {
 const NUM_RANGE = {
   screenshot_count: [1, 200], screenshot_start_seconds: [0, 86400],
   screenshot_interval_seconds: [1, 86400], tracker_search_rate_limit: [1, 600],
+  music_category_id: [0, 99999999], audiobook_category_id: [0, 99999999], book_category_id: [0, 99999999],
+  music_type_id: [0, 99999999], audiobook_type_id: [0, 99999999], book_type_id: [0, 99999999],
+  media_resolution_id: [0, 99999999], metadata_timeout_seconds: [1, 300],
+  musicbrainz_request_interval: [1, 60], openlibrary_request_interval: [0, 60],
 };
 
 const settingsLoad = guard(async () => {
   const c = state.config = await api("GET", "/api/config");
   const draft = { secrets: {} };
   const bool = (k, label) => h("label", { class: "chk" }, h("input", { type: "checkbox", checked: !!c[k], onchange: (e) => (draft[k] = e.target.checked) }), label);
-  const field = (k, label, type = "text", hint = "") => h("div", { class: "f" }, h("label", {}, label),
-    h("input", { type, value: c[k] ?? "", ...(type === "number" ? { min: NUM_RANGE[k][0], max: NUM_RANGE[k][1], step: 1 } : {}),
+  const select = (k, label, options, hint = "") => {
+    const el = h("select", { onchange: (e) => (draft[k] = e.target.value) }, options.map(([v, text]) => h("option", { value: v }, text)));
+    el.value = c[k] ?? options[0][0];
+    return h("div", { class: "f" }, h("label", {}, label), el, hint && h("div", { class: "muted small" }, hint));
+  };
+  const field = (k, label, type = "text", hint = "", step = 1) => h("div", { class: "f" }, h("label", {}, label),
+    h("input", { type, value: c[k] ?? "", ...(type === "number" ? { min: NUM_RANGE[k][0], max: NUM_RANGE[k][1], step } : {}),
       oninput: (e) => { if (type === "number") { if (e.target.value !== "") draft[k] = Number(e.target.value); } else draft[k] = e.target.value; } }),
     hint && h("div", { class: "muted small" }, hint));
   const secret = (k, label) => h("div", { class: "f" }, h("label", {}, label, " ", h("span", { class: "muted small" }, c.secrets[k] ? "(set – leave blank to keep)" : "(not set)")),
@@ -819,6 +862,25 @@ const settingsLoad = guard(async () => {
     field("screenshot_count", "Number of screenshots", "number", "Total screenshots generated per release. For TV packs, this is distributed across episodes. Can be overridden per batch when adding jobs."),
     field("screenshot_start_seconds", "First screenshot time (seconds)", "number", "Used for single-video releases; e.g. 60 means 1:00."),
     field("screenshot_interval_seconds", "Screenshot interval (seconds)", "number", "Used for single-video releases; e.g. 240 means every 4 minutes."),
+    h("h2", {}, "Music, audiobooks and books"),
+    h("p", { class: "muted small" }, "Music is matched on MusicBrainz and audiobooks / books on Open Library. The link of the match (MusicBrainz release or Open Library work) is put in the tracker description and can also be sent as its own upload field. Tracker ids are specific to your tracker: until the category and type ids are set (here, or in the pre-upload form) these uploads are blocked."),
+    select("media_type", "Default media type", MEDIA_TYPES, "Auto-detect uses the file types (an .m4b or a folder named ‘audiobook’ / ‘unabridged’ is an audiobook; other audio is music). Can be overridden per job."),
+    bool("musicbrainz_enabled", "Look up music on MusicBrainz"), bool("openlibrary_enabled", "Look up audiobooks and books on Open Library"),
+    bool("require_metadata_match", "Skip the upload when there is no match (nothing to link to)"),
+    bool("include_cover_in_description", "Put the cover image at the top of the description"),
+    select("book_name_order", "Book / audiobook folder names", [["author_title", "Author - Title"], ["title_author", "Title - Author"]], "Only used when the files carry no usable tags."),
+    field("music_category_id", "Music category id", "number"), field("music_type_id", "Music type id", "number"),
+    field("audiobook_category_id", "Audiobook category id", "number"), field("audiobook_type_id", "Audiobook type id", "number"),
+    field("book_category_id", "Book category id", "number"), field("book_type_id", "Book type id", "number"),
+    field("media_resolution_id", "Resolution id for these uploads", "number", "Sent as resolution_id with music / audiobook / book uploads. 0 leaves it out."),
+    field("musicbrainz_link_field", "Upload form field for the MusicBrainz link (optional)", "text", "Blank = only in the description. Otherwise the link is also sent under this field name."),
+    field("openlibrary_link_field", "Upload form field for the Open Library link (optional)", "text", "Blank = only in the description."),
+    field("metadata_user_agent", "User-Agent for MusicBrainz / Open Library", "text", "Both services ask clients to identify themselves; add a contact, e.g. aaodf/1.0 ( you@example.com )."),
+    field("metadata_timeout_seconds", "Request timeout (seconds)", "number"),
+    field("musicbrainz_request_interval", "Seconds between MusicBrainz requests", "number", "MusicBrainz allows one request per second.", "any"),
+    field("openlibrary_request_interval", "Seconds between Open Library requests", "number", "", "any"),
+    field("musicbrainz_url", "MusicBrainz URL"), field("coverart_url", "Cover Art Archive URL"),
+    field("openlibrary_url", "Open Library URL"), field("openlibrary_covers_url", "Open Library covers URL"),
     h("h2", {}, "Download client"),
     h("p", { class: "muted small" }, "After a successful tracker upload, send the returned torrent URL to a download client. Disable this to download the .torrent into the generated output folder. Category and save path can be overridden per batch when adding jobs."),
     clientFields,

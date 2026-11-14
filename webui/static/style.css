@@ -141,3 +141,7 @@ button.btn.on { background: var(--sel); color: var(--accent); border-color: var(
 .editform .f input[type=text], .editform .f input[type=number], .editform .f select, .editform .f textarea { width: 100%; }
 .editform select, .editform textarea { background: var(--bg); color: var(--text); border: 1px solid var(--line); border-radius: 6px; padding: 6px 9px; font: inherit; }
 .editform textarea { font: 12px/1.4 ui-monospace, monospace; resize: vertical; }
+
+/* media type / book name order selects (options panel and Settings) */
+.optfields select, .form .f select { background: var(--bg); color: var(--text); border: 1px solid var(--line); border-radius: 6px; padding: 7px 9px; font: inherit; width: 100%; }
+.form .f input[type=number] { width: 140px; }

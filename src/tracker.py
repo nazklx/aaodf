@@ -23,6 +23,7 @@ from .models import Job, Plan
 from .parsers import parse_tags, mediainfo_tags, tv_numbers, build_name, pick_type
 from .tmdb import tmdb_by_id, parse_release
 from .core import short_msg, human_size, pause
+from .media import KIND_LABELS, SOURCE_LABELS, SOURCE_OF_KIND, build_media_name, media_tags
 
 try:
     import termios, tty
@@ -40,6 +41,8 @@ CATEGORY_CHOICES = [
     (14, "Movie · DVD"), (17, "Movie · Pack"), (18, "Movie · x264"), (19, "Movie · x265"),
     (20, "Movie · XviD"), (58, "Movie · WEB"), 
     (43, "Anime"), (61, "Anime · Packs"), (62, "Anime · Movies"),
+    (38, "Music · Audio"), (39, "Music · FLAC"), (41, "Music · Packs"),
+    (44, "Audiobooks"), (46, "Books"),
     (21, "TV · SD"), (22, "TV · 2160p"), (23, "TV · BluRay"), (25, "TV · DVD"), (28, "TV · Pack"),
     (30, "TV · x264"), (31, "TV · x265"), (32, "TV · XviD"), (59, "TV · WEB"),
 ]
@@ -50,8 +53,19 @@ CATEGORY_CHOICES = [
 PROMO_KEYS = ("free", "free_days", "doubleup", "doubleup_days", "featured")
 MAX_PROMO_DAYS = 3650
 
+# Non-video uploads (music / audiobook / book) carry the MusicBrainz / Open Library link in
+# Plan.fields["source_url"] (+ "source_site"). These two never go to the tracker as-is: the link is
+# sent in the description and, when `musicbrainz_link_field` / `openlibrary_link_field` is set in the
+# config, also as that extra form field (see tracker_payload()).
+INTERNAL_KEYS = ("source_url", "source_site")
+MAX_URL_LEN = 500
+_URL_RE = re.compile(r"^https?://\S+$")
+
 def clean_title(name: str) -> str:
     return re.sub(r"\s+", " ", _FORBIDDEN_RE.sub("", name)).strip()[:255]
+
+def is_video(kind: str) -> bool:
+    return kind == "video"
 
 def compose_description(overview: str, links: list[str]) -> str:
     return "\n\n".join(p for p in (overview, "\n".join(links)) if p)
@@ -147,10 +161,16 @@ def promo_defaults() -> dict:
 
 def tracker_payload(fields: dict) -> dict:
     """Turn Plan.fields into the form data the tracker's upload API expects."""
-    data = {k: v for k, v in fields.items() if k not in PROMO_KEYS and v is not None}
+    data = {k: v for k, v in fields.items() if k not in PROMO_KEYS + INTERNAL_KEYS and v is not None}
     for key in ("imdb", "tvdb"):          # optional ids: leave them out instead of sending 0
         if not data.get(key):
             data.pop(key, None)
+    if not data.get("mediainfo"):         # books have none
+        data.pop("mediainfo", None)
+    link, site = str(fields.get("source_url") or ""), str(fields.get("source_site") or "")
+    link_field = str(load_config().get(f"{site}_link_field", "") or "").strip() if site else ""
+    if link and link_field:
+        data[link_field] = link
     if fields.get("free"):
         data["free"] = int(fields["free"])
         if fields.get("free_days"):
@@ -164,8 +184,52 @@ def tracker_payload(fields: dict) -> dict:
         data["sticky"] = 1
     return data
 
+def _media_id(key: str) -> int:
+    return _config_int(key, 0, 99_999_999)
+
+def compute_media_plan(job: Job, mediainfo_text: str) -> Plan | None:
+    """Upload plan for music (MusicBrainz) and books / audiobooks (Open Library)."""
+    kind, meta = job.media_kind, job.meta
+    source = SOURCE_OF_KIND[kind]
+    if meta is None and config.get("require_metadata_match", True):
+        print(f"No {SOURCE_LABELS[source]} match, so there is no source link to send - skipping tracker upload.")
+        return None
+    if job.tags is None:
+        job.tags = media_tags(kind, job.sources)
+    name = clean_title(build_media_name(job))
+    fields = {
+        "name": name,
+        "description": job.description or name,
+        "mediainfo": mediainfo_text,
+        "category_id": _media_id(f"{kind}_category_id"),
+        "type_id": _media_id(f"{kind}_type_id"),
+        "tmdb": 0,
+        "anonymous": int(ANONYMOUS_UPLOAD),
+        "personal_release": int(PERSONAL_RELEASE),
+        "stream": 0,
+        "sd": 0,
+        "source_url": meta.url if meta else "",
+        "source_site": source if meta else "",
+        **promo_defaults(),
+    }
+    if resolution := _media_id("media_resolution_id"):
+        fields["resolution_id"] = resolution
+    return Plan(fields, False, None, kind, True, meta, [], media_kind=kind)
+
+def plan_problems(plan: Plan) -> list[str]:
+    """Things that must be fixed before this plan can be uploaded (non-video ids come from the config)."""
+    if is_video(plan.media_kind):
+        return []
+    problems = []
+    for key, label in (("category_id", "Category"), ("type_id", "Type")):
+        if int(plan.fields.get(key) or 0) < 1:
+            problems.append(f"{label} id is not set - set {plan.media_kind}_{key} in the config or enter it in the upload form")
+    return problems
+
 def compute_plan(job: Job, mediainfo_text: str) -> Plan | None:
     from .tmdb import parse_release
+    if not is_video(job.media_kind):
+        return compute_media_plan(job, mediainfo_text)
     if not TRACKER_API_TOKEN.strip():
         print("TRACKER_API_TOKEN is empty - skipping tracker upload.")
         return None
@@ -239,7 +303,9 @@ PLAN_FIELDS_MARKER = "PLAN_FIELDS "
 def plan_form(plan: Plan) -> dict:
     """The fields the web UI may edit before upload (mediainfo is deliberately left out)."""
     f = plan.fields
-    form = {k: f[k] for k in _FORM_KEYS + PROMO_KEYS}
+    form = {k: f[k] for k in _FORM_KEYS + PROMO_KEYS if k in f}   # resolution_id is absent for non-video
+    if not is_video(plan.media_kind):
+        form["source_url"] = f.get("source_url", "")
     form["imdb"] = f.get("imdb", 0)
     form["tvdb"] = f.get("tvdb", 0)
     if plan.tv:
@@ -302,18 +368,35 @@ def apply_edits(plan: Plan, raw: str) -> list[str]:
             else:
                 staged[key] = value.strip() or plan.fields["name"]
         elif key == "type_id":
-            if _whole(value, 0, 10**6) not in TYPE_IDS.values():
+            if not is_video(plan.media_kind):
+                if (number := _whole(value, 1, 10**6)) is None:
+                    errors.append("Type must be a whole number from 1 to 1000000")
+                else:
+                    staged[key] = number
+            elif _whole(value, 0, 10**6) not in TYPE_IDS.values():
                 errors.append("Type is not one of the known types")
             else:
                 staged[key] = int(value)
+        elif key == "source_url":
+            if is_video(plan.media_kind):
+                errors.append("Source link only applies to music, audiobooks and books")
+            elif not isinstance(value, str) or len(value.strip()) > MAX_URL_LEN or (
+                    value.strip() and not _URL_RE.match(value.strip())):
+                errors.append("Source link must be an http(s) URL")
+            else:
+                staged[key] = value.strip()
         elif key == "resolution_id":
-            if _whole(value, 0, 10**6) not in RESOLUTION_IDS.values():
+            if not is_video(plan.media_kind):
+                errors.append("Resolution only applies to video")
+            elif _whole(value, 0, 10**6) not in RESOLUTION_IDS.values():
                 errors.append("Resolution is not one of the known resolutions")
             else:
                 staged[key] = int(value)
         elif key in _ID_EDITS:
             label, lo, hi = _ID_EDITS[key]
-            if key in ("season_number", "episode_number") and not plan.tv:
+            if key in ("tmdb", "imdb", "tvdb") and not is_video(plan.media_kind):
+                errors.append(f"{label} only applies to video")
+            elif key in ("season_number", "episode_number") and not plan.tv:
                 errors.append(f"{label} only applies to TV releases")
             elif (number := _whole(value, lo, hi)) is None:
                 errors.append(f"{label} must be a whole number from {lo} to {hi}")
@@ -329,6 +412,11 @@ def apply_edits(plan: Plan, raw: str) -> list[str]:
     if errors:
         return errors
 
+    if "source_url" in staged:      # keep the link in the description in step with the edited link
+        old_url, new_url = plan.fields.get("source_url", ""), staged["source_url"]
+        text = staged.get("description", plan.fields["description"])
+        if old_url and old_url != new_url and old_url in text:
+            staged["description"] = text.replace(old_url, new_url)
     plan.fields.update(staged)
     plan.edited.update(staged)
     if not plan.fields.get("free"):
@@ -340,7 +428,38 @@ def apply_edits(plan: Plan, raw: str) -> list[str]:
 def _days_text(days: int) -> str:
     return f"{days} day{'s' if days != 1 else ''}" if days else "no expiry"
 
+def print_media_plan(plan: Plan) -> None:
+    f = plan.fields
+    desc = f["description"]
+    if not sys.stdin.isatty():
+        print(PLAN_FIELDS_MARKER + json.dumps(
+            {"fields": plan_form(plan), "choices": plan_choices(), "is_tv": False,
+             "media_kind": plan.media_kind}), flush=True)
+    flags = [label for key, label in (("anonymous", "anonymous"), ("personal_release", "personal release")) if f.get(key)]
+    link_field = str(load_config().get(f"{f.get('source_site', '')}_link_field", "") or "").strip()
+    print()
+    print("Upload details:")
+    print(f"  Name:         {f['name']}")
+    print(f"  Kind:         {KIND_LABELS.get(plan.media_kind, plan.media_kind)}")
+    print(f"  Category:     id {f['category_id'] or 'NOT SET'}")
+    print(f"  Type:         id {f['type_id'] or 'NOT SET'}")
+    if f.get("resolution_id"):
+        print(f"  Resolution:   id {f['resolution_id']}")
+    if plan.info:
+        print(f"  Match:        {plan.info.source_name}: {plan.info.label}")
+    print(f"  Source link:  {f['source_url'] or 'none'}"
+          + (f"  (also sent as form field '{link_field}')" if f["source_url"] and link_field else ""))
+    print(f"  Flags:        {', '.join(flags) or 'none'}")
+    print(f"  Free:         {str(f['free']) + '% for ' + _days_text(f['free_days']) if f['free'] else 'no'}")
+    print(f"  Double up:    {_days_text(f['doubleup_days']) if f['doubleup'] else 'no'}")
+    print(f"  Featured:     {'yes (sticky)' if f['featured'] else 'no'}")
+    print(f"  Description:  {len(desc)} characters")
+    for problem in plan_problems(plan):
+        print(f"  WARNING:      {problem}")
+
 def print_plan(plan: Plan) -> None:
+    if not is_video(plan.media_kind):
+        return print_media_plan(plan)
     f = plan.fields
     note = ""
     if not plan.type_known and "type_id" not in plan.edited:
@@ -388,12 +507,14 @@ def _tracker_search_url() -> str:
     return urlunsplit((parsed.scheme, parsed.netloc, path, "", ""))
 
 
-def tracker_search_title(label: str) -> str:
-    raw = Path(label).stem if Path(label).suffix.lower() in (".mkv", ".mp4") else label
+def tracker_search_title(label: str, kind: str = "video") -> str:
+    from .media import MEDIA_EXTS
+    raw = Path(label).stem if Path(label).suffix.lower() in MEDIA_EXTS else label
     title, year, _ = parse_release(raw)
     title = re.sub(r"[._]+", " ", title)
     title = re.sub(r"\s+", " ", title).strip(" -._")
-    query = f"{title} {year}" if title and year else title
+    # Music / book names put the year in brackets ("Album (2020) [FLAC]"), so a "Title 2020" query would miss them.
+    query = f"{title} {year}" if title and year and is_video(kind) else title
     return query or label
 
 
@@ -798,6 +919,9 @@ def upload_release(job: Job, mediainfo_text: str, extract_frames_func=None) -> b
     if plan is None:
         return False
     if not CONFIRM_BEFORE_UPLOAD:
+        if problems := plan_problems(plan):
+            print("Cannot upload: " + "; ".join(problems))
+            return False
         uploaded, download_url = post_upload(plan.fields, job.torrent_path, job.nfo_path)
         return deliver_torrent(download_url, job.torrent_path) if uploaded else False
 
@@ -815,6 +939,9 @@ def upload_release(job: Job, mediainfo_text: str, extract_frames_func=None) -> b
                 continue
             key = "1"
         if key == "1":
+            if problems := plan_problems(plan):
+                print("Cannot upload: " + "; ".join(problems))
+                continue
             uploaded, download_url = post_upload(plan.fields, job.torrent_path, job.nfo_path)
             if uploaded:
                 return deliver_torrent(download_url, job.torrent_path)

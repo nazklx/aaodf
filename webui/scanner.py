@@ -12,12 +12,12 @@ import time
 import uuid
 from pathlib import Path
 
-from src.core import find_videos
+from src.config import load_config
+from src.media import MEDIA_EXTS, detect_kind, normalize_hint
 from src.tracker import SearchCancelled, search_tracker, tracker_search_title
 
 log = logging.getLogger(__name__)
 
-VIDEO_EXTS = {".mkv", ".mp4"}
 MAX_ENTRIES = 5000
 
 
@@ -41,7 +41,7 @@ class ScanManager:
             if self.scan and self.scan["status"] == "running":
                 raise ScanBusy()
             candidates = [p for p in directory.iterdir() if not p.name.startswith(".") and p.is_dir()]
-            candidates += [p for p in directory.iterdir() if p.is_file() and p.suffix.lower() in VIDEO_EXTS]
+            candidates += [p for p in directory.iterdir() if p.is_file() and p.suffix.lower() in MEDIA_EXTS]
             candidates.sort(key=lambda p: (not p.is_dir(), p.name.casefold()))
             if len(candidates) > MAX_ENTRIES:
                 raise ScanTooLarge(f"Directory contains more than {MAX_ENTRIES} immediate entries")
@@ -78,13 +78,15 @@ class ScanManager:
     @staticmethod
     def _check(candidate: Path, cancel: threading.Event) -> dict:
         is_dir = candidate.is_dir()
-        query = tracker_search_title(candidate.name)
+        # Uses the configured media_type (auto-detect by default); per-job overrides don't apply to scans.
+        media = detect_kind(candidate, normalize_hint(load_config().get("media_type", "auto")))
+        query = tracker_search_title(candidate.name, media or "video")
         item = {
             "path": str(candidate), "name": candidate.name, "kind": "folder" if is_dir else "file",
-            "query": query, "matches": [], "match_count": 0,
+            "media": media, "query": query, "matches": [], "match_count": 0,
         }
-        # A folder with no MKV/MP4 can't become a job, so don't spend a request on it.
-        if is_dir and not find_videos(candidate):
+        # A folder with no supported media can't become a job, so don't spend a request on it.
+        if is_dir and media is None:
             return {**item, "eligible": False, "status": "skipped"}
         matches = search_tracker(query, cancel=cancel)
         return {**item, "matches": matches[:10], "match_count": len(matches), "eligible": True,

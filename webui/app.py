@@ -8,19 +8,32 @@ import json
 import os
 import secrets
 import shutil
+import re
 import subprocess
 from pathlib import Path
 
 from flask import Flask, Response, abort, jsonify, make_response, redirect, request, send_file, send_from_directory
 
+from src.config import MEDIA_TYPES
+from src.media import file_class
 from .jobs import ACTIVE, OUTPUT, ROOT, STATE_DIR, JobManager, clean_options, clean_plan_edits, inspect_target
 from .scanner import ScanBusy, ScanManager, ScanTooLarge
 
-VIDEO_EXTS = {".mkv", ".mp4"}
 SENSITIVE = ("announce_url", "tmdb_api_key", "tracker_api_token", "upload_endpoint")
-BOOL_KEYS = ("confirm_before_upload", "anonymous_upload", "personal_release", "stream_optimized")
-STR_KEYS = ("group_separator", "run_as_user", "tracker_search_endpoint")
-NUM_KEYS = ("screenshot_count", "screenshot_start_seconds", "screenshot_interval_seconds", "tracker_search_rate_limit")
+BOOL_KEYS = ("confirm_before_upload", "anonymous_upload", "personal_release", "stream_optimized",
+             "musicbrainz_enabled", "openlibrary_enabled", "require_metadata_match", "include_cover_in_description")
+STR_KEYS = ("group_separator", "run_as_user", "tracker_search_endpoint", "metadata_user_agent")
+# Base URLs of the metadata services (must be http(s)); the link fields are the optional extra upload
+# form field names that carry the MusicBrainz / Open Library link to the tracker.
+URL_KEYS = ("musicbrainz_url", "coverart_url", "openlibrary_url", "openlibrary_covers_url")
+LINK_FIELD_KEYS = ("musicbrainz_link_field", "openlibrary_link_field")
+ENUM_KEYS = {"media_type": MEDIA_TYPES, "book_name_order": ("author_title", "title_author")}
+NUM_KEYS = ("screenshot_count", "screenshot_start_seconds", "screenshot_interval_seconds", "tracker_search_rate_limit",
+            "music_category_id", "audiobook_category_id", "book_category_id",
+            "music_type_id", "audiobook_type_id", "book_type_id", "media_resolution_id",
+            "metadata_timeout_seconds")
+FLOAT_KEYS = {"musicbrainz_request_interval": (1.0, 60.0), "openlibrary_request_interval": (0.0, 60.0)}
+_LINK_FIELD_RE = re.compile(r"^[A-Za-z0-9_.\-\[\]]{0,64}$")
 # Default promotion flags (set in config.json, overridable per job); read-only in the web UI.
 PROMO_KEYS = ("free", "free_days", "doubleup", "doubleup_days", "featured")
 MAX_ENTRIES = 5000
@@ -93,7 +106,8 @@ def create_app(fs_root: Path, token: str, max_concurrent: int = 1) -> Flask:
                     entries.append({
                         "name": e.name, "path": os.path.join(str(p), e.name), "dir": is_dir,
                         "size": None if is_dir else st.st_size, "mtime": st.st_mtime,
-                        "video": (not is_dir) and Path(e.name).suffix.lower() in VIDEO_EXTS,
+                        "kind": None if is_dir else file_class(e.name),     # video / audio / book
+                        "video": (not is_dir) and file_class(e.name) == "video",
                     })
         except PermissionError:
             abort(403, "Permission denied")
@@ -103,7 +117,7 @@ def create_app(fs_root: Path, token: str, max_concurrent: int = 1) -> Flask:
 
     @app.get("/api/inspect")
     def inspect():
-        return jsonify(inspect_target(safe_path(request.args.get("path", ""))))
+        return jsonify(inspect_target(safe_path(request.args.get("path", "")), request.args.get("type", "auto")))
 
     @app.post("/api/duplicates/scan")
     def duplicate_scan():
@@ -321,7 +335,8 @@ def create_app(fs_root: Path, token: str, max_concurrent: int = 1) -> Flask:
     @app.get("/api/config")
     def config_get():
         cfg = read_cfg()
-        out = {k: cfg.get(k) for k in BOOL_KEYS + STR_KEYS + NUM_KEYS + PROMO_KEYS}
+        out = {k: cfg.get(k) for k in (BOOL_KEYS + STR_KEYS + NUM_KEYS + PROMO_KEYS + URL_KEYS
+                                       + LINK_FIELD_KEYS + tuple(ENUM_KEYS) + tuple(FLOAT_KEYS))}
         client = cfg.get("download_client")
         if isinstance(client, dict) and client:
             out["download_client"] = {k: client.get(k, "") for k in ("type", "url", "username", "category", "tags", "save_path", "download_dir")}
@@ -346,6 +361,10 @@ def create_app(fs_root: Path, token: str, max_concurrent: int = 1) -> Flask:
             "screenshot_start_seconds": (0, 86400),
             "screenshot_interval_seconds": (1, 86400),
             "tracker_search_rate_limit": (1, 600),
+            "music_category_id": (0, 99999999), "audiobook_category_id": (0, 99999999), "book_category_id": (0, 99999999),
+            "music_type_id": (0, 99999999), "audiobook_type_id": (0, 99999999), "book_type_id": (0, 99999999),
+            "media_resolution_id": (0, 99999999),
+            "metadata_timeout_seconds": (1, 300),
         }
         for k, (minimum, maximum) in limits.items():
             if k in body:
@@ -358,6 +377,36 @@ def create_app(fs_root: Path, token: str, max_concurrent: int = 1) -> Flask:
                     abort(400, f"{k} must be an integer")
                 if not minimum <= value <= maximum:
                     abort(400, f"{k} must be between {minimum} and {maximum}")
+                cfg[k] = value
+        for k, (minimum, maximum) in FLOAT_KEYS.items():
+            if k in body:
+                value = body[k]
+                if isinstance(value, bool):
+                    abort(400, f"{k} must be a number")
+                try:
+                    value = float(value)
+                except (TypeError, ValueError, OverflowError):
+                    abort(400, f"{k} must be a number")
+                if not minimum <= value <= maximum:   # also rejects NaN
+                    abort(400, f"{k} must be between {minimum:g} and {maximum:g}")
+                cfg[k] = value
+        for k, allowed in ENUM_KEYS.items():
+            if k in body:
+                value = str(body[k]).strip().lower()
+                if value not in allowed:
+                    abort(400, f"{k} must be one of: {', '.join(allowed)}")
+                cfg[k] = value
+        for k in URL_KEYS:
+            if k in body:
+                value = str(body[k]).strip().rstrip("/")
+                if not re.match(r"^https?://[^\s/]+(/\S*)?$", value):
+                    abort(400, f"{k} must be an http(s) URL")
+                cfg[k] = value
+        for k in LINK_FIELD_KEYS:
+            if k in body:
+                value = str(body[k]).strip()
+                if not _LINK_FIELD_RE.match(value):
+                    abort(400, f"{k} may only contain letters, digits and _ . - [ ] (max 64 characters)")
                 cfg[k] = value
         if "download_client" in body:
             incoming = body["download_client"]
